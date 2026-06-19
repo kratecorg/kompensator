@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"kompensator/internal/config"
 	"kompensator/internal/gitsync"
@@ -14,6 +16,10 @@ import (
 	"kompensator/internal/repo"
 	"kompensator/internal/runtime"
 )
+
+// healthTimeout bounds how long a Blue/Green switch waits for the new color to
+// become healthy before giving up and reporting the app as failed.
+const healthTimeout = 5 * time.Minute
 
 // Options controls a reconcile run.
 type Options struct {
@@ -151,39 +157,110 @@ func reconcileApp(ctx context.Context, log *slog.Logger, node string, opts Optio
 		res.Skipped++
 		return nil
 	}
+	desiredRef := desired.Ref()
 
-	project := runtime.ProjectName(node, opts.Env, app.Name)
-	running, err := runtime.RunningImage(ctx, project, app.Name)
+	running, err := runtime.RunningColors(ctx, node, opts.Env, app.Name, app.Name)
 	if err != nil {
 		return err
 	}
 
-	desiredRef := desired.Ref()
-	if running == desiredRef {
-		alog.Info("in sync", "image", desiredRef)
+	// If a running slot already serves the desired image, we are in sync. Stop
+	// any other (stale) slot that may have been left behind by a prior switch.
+	if active, ok := colorServing(running, desiredRef); ok {
+		alog.Info("in sync", "image", desiredRef, "color", active)
+		if err := stopOtherColors(ctx, alog, node, opts.Env, app.Name, active, running); err != nil {
+			return err
+		}
 		res.InSync++
 		return nil
 	}
 
-	alog.Info("drift detected", "running", emptyAs(running, "<none>"), "desired", desiredRef)
+	// Blue/Green switch: deploy the desired image into the idle slot, wait for
+	// it to become fully healthy, verify it, then stop the previously active
+	// slot(s).
+	target := runtime.OtherColor(currentColor(running))
+	targetProject := runtime.ProjectName(node, opts.Env, app.Name, target)
+
+	alog.Info("drift detected, deploying to idle color",
+		"running", describeColors(running),
+		"desired", desiredRef,
+		"target_color", target,
+	)
 
 	composeFile := filepath.Join(envDir, app.Compose)
-	if err := runtime.Deploy(ctx, composeFile, project, node, desired.Image, desired.Tag); err != nil {
+	if err := runtime.Deploy(ctx, composeFile, targetProject, node, desired.Image, desired.Tag); err != nil {
 		return err
 	}
 
-	// Verify the new image is actually running.
-	running, err = runtime.RunningImage(ctx, project, app.Name)
+	alog.Info("waiting for new color to become healthy", "color", target, "project", targetProject)
+	if err := runtime.WaitHealthy(ctx, targetProject, healthTimeout); err != nil {
+		return fmt.Errorf("new color %q not healthy: %w", target, err)
+	}
+
+	// Verify the new slot actually serves the desired image before cutting over.
+	got, err := runtime.RunningImage(ctx, targetProject, app.Name)
 	if err != nil {
 		return err
 	}
-	if running != desiredRef {
-		return fmt.Errorf("after deploy, running image %q != desired %q", running, desiredRef)
+	if got != desiredRef {
+		return fmt.Errorf("after deploy, running image %q != desired %q", got, desiredRef)
+	}
+	alog.Info("new color healthy", "color", target, "image", desiredRef)
+
+	// New color is live and healthy: stop the old color(s).
+	if err := stopOtherColors(ctx, alog, node, opts.Env, app.Name, target, running); err != nil {
+		return err
 	}
 
-	alog.Info("deployed", "image", desiredRef)
+	alog.Info("deployed", "image", desiredRef, "color", target)
 	res.Deployed++
 	return nil
+}
+
+// colorServing returns the running color whose image matches ref, if any.
+func colorServing(running []runtime.ColorState, ref string) (string, bool) {
+	for _, cs := range running {
+		if cs.Image == ref {
+			return cs.Color, true
+		}
+	}
+	return "", false
+}
+
+// currentColor returns the color to treat as currently active, or "" when
+// nothing is running (so the first deploy lands in blue).
+func currentColor(running []runtime.ColorState) string {
+	if len(running) == 0 {
+		return ""
+	}
+	return running[0].Color
+}
+
+// stopOtherColors tears down every running slot except keep.
+func stopOtherColors(ctx context.Context, log *slog.Logger, node, env, app, keep string, running []runtime.ColorState) error {
+	for _, cs := range running {
+		if cs.Color == keep {
+			continue
+		}
+		project := runtime.ProjectName(node, env, app, cs.Color)
+		log.Info("stopping old color", "color", cs.Color, "project", project)
+		if err := runtime.Stop(ctx, project); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// describeColors renders the running slots as "blue=img,green=img" for logs.
+func describeColors(running []runtime.ColorState) string {
+	if len(running) == 0 {
+		return "<none>"
+	}
+	parts := make([]string, 0, len(running))
+	for _, cs := range running {
+		parts = append(parts, cs.Color+"="+cs.Image)
+	}
+	return strings.Join(parts, ",")
 }
 
 func (r *Result) add(o Result) {
@@ -200,6 +277,21 @@ type AppStatus struct {
 	App     string
 	Desired string // "image:tag", or "" if absent from deployment-state
 	Running string // "image:tag", or "" if not running
+	Color   string // active Blue/Green slot ("blue"/"green"), or "" if not running
+}
+
+// runningRef picks the image/color to report for status. It prefers the slot
+// serving the desired image; otherwise the first running slot.
+func runningRef(running []runtime.ColorState, desired string) (image, color string) {
+	for _, cs := range running {
+		if cs.Image == desired {
+			return cs.Image, cs.Color
+		}
+	}
+	if len(running) > 0 {
+		return running[0].Image, running[0].Color
+	}
+	return "", ""
 }
 
 // State summarises the app's status as a short word.
@@ -266,12 +358,11 @@ func Status(ctx context.Context, opts Options) ([]AppStatus, error) {
 				if d, ok := state[app.Name]; ok && d.Image != "" && d.Tag != "" {
 					st.Desired = d.Ref()
 				}
-				project := runtime.ProjectName(cfg.Node.Name, env, app.Name)
-				running, err := runtime.RunningImage(ctx, project, app.Name)
+				running, err := runtime.RunningColors(ctx, cfg.Node.Name, env, app.Name, app.Name)
 				if err != nil {
 					return out, err
 				}
-				st.Running = running
+				st.Running, st.Color = runningRef(running, st.Desired)
 				out = append(out, st)
 			}
 		}
@@ -315,13 +406,6 @@ func lock(home string) (unlock func(), held bool, err error) {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, true, nil
-}
-
-func emptyAs(s, alt string) string {
-	if s == "" {
-		return alt
-	}
-	return s
 }
 
 // underlying unwraps a fmt.Errorf-wrapped error one level for os.IsNotExist.
