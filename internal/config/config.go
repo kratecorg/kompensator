@@ -20,8 +20,9 @@ const configHeader = "# kompensator node-local config (managed by 'kompensator b
 // the status of all nodes from a checked-out deployment repo) leaves it empty.
 // A reconcile agent, by contrast, requires node.name.
 type Config struct {
-	Node  Node   `yaml:"node"`
-	Repos []Repo `yaml:"repos"`
+	Node   Node    `yaml:"node"`
+	Naming *Naming `yaml:"naming,omitempty"`
+	Repos  []Repo  `yaml:"repos"`
 }
 
 // IsController reports whether this config is for a controller-only host, i.e.
@@ -33,6 +34,29 @@ func (c *Config) IsController() bool {
 // Node identifies this machine within a deployment repo's inventory.
 type Node struct {
 	Name string `yaml:"name"`
+}
+
+// Naming controls which optional leading segments are used in the generated
+// Docker Compose project (and therefore container) names. The mandatory
+// segments env, stack, project, color, service and replica are always present;
+// the deployment repo name and the node name are optional and default to
+// enabled. Disable the node segment when every node owns its own host, or the
+// repo segment when a single repo makes it redundant.
+type Naming struct {
+	IncludeRepo *bool `yaml:"includeRepo,omitempty"`
+	IncludeNode *bool `yaml:"includeNode,omitempty"`
+}
+
+// UseRepo reports whether the deployment repo name is part of project names
+// (default true). A nil Naming uses the defaults.
+func (n *Naming) UseRepo() bool {
+	return n == nil || n.IncludeRepo == nil || *n.IncludeRepo
+}
+
+// UseNode reports whether the node name is part of project names (default true).
+// A nil Naming uses the defaults.
+func (n *Naming) UseNode() bool {
+	return n == nil || n.IncludeNode == nil || *n.IncludeNode
 }
 
 // Repo is a deployment repository the node tracks.

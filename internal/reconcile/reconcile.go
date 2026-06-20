@@ -86,7 +86,11 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 		}
 		log.Info("repo synced", "repo", r.Name, "commit", commit)
 
-		res, err := reconcileRepo(ctx, log, cfg.Node.Name, opts, dest)
+		names := runtime.Names{
+			Repo: r.Name, Node: cfg.Node.Name,
+			IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
+		}
+		res, err := reconcileRepo(ctx, log, names, opts, dest)
 		total.add(res)
 		if err != nil {
 			return total, fmt.Errorf("reconcile repo %q: %w", r.Name, err)
@@ -238,14 +242,14 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 }
 
 // reconcileRepo reconciles every stack placed in the environment for this repo.
-func reconcileRepo(ctx context.Context, log *slog.Logger, node string, opts Options, repoRoot string) (Result, error) {
+func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot string) (Result, error) {
 	var res Result
 
 	inv, err := repo.LoadInventory(repoRoot)
 	if err != nil {
 		return res, err
 	}
-	if !inv.InEnv(node, opts.Env) {
+	if !inv.InEnv(names.Node, opts.Env) {
 		log.Info("node not in this repo's env, skipping repo", "repo", repoRoot)
 		return res, nil
 	}
@@ -269,7 +273,7 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, node string, opts Opti
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
 		}
 		for _, p := range stack.Projects {
-			if err := reconcileProject(ctx, log, node, opts, repoRoot, stackName, p, state[p.Name], &res); err != nil {
+			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, state[p.Name], &res); err != nil {
 				log.Error("project reconcile failed", "stack", stackName, "project", p.Name, "error", err)
 				res.Failed++
 			}
@@ -280,7 +284,7 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, node string, opts Opti
 
 // reconcileProject brings one compose project to its desired state, using its
 // Blue/Green or recreate strategy.
-func reconcileProject(ctx context.Context, log *slog.Logger, node string, opts Options, repoRoot, stack string, p repo.Project, desired map[string]repo.ServiceImage, res *Result) error {
+func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, desired map[string]repo.ServiceImage, res *Result) error {
 	plog := log.With("stack", stack, "project", p.Name, "strategy", p.Strategy)
 
 	if len(desired) == 0 {
@@ -300,15 +304,15 @@ func reconcileProject(ctx context.Context, log *slog.Logger, node string, opts O
 	composeFile := repo.ComposeFile(repoRoot, stack, p)
 
 	if p.BlueGreen() {
-		return blueGreenProject(ctx, plog, node, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
+		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
 	}
-	return recreateProject(ctx, plog, node, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
+	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
 }
 
 // recreateProject deploys a project in place (no color). Used for projects that
 // cannot run two colors at once, e.g. a database.
-func recreateProject(ctx context.Context, log *slog.Logger, node string, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
-	proj := runtime.ProjectName(node, opts.Env, stack, project, "")
+func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
+	proj := names.Project(opts.Env, stack, project, "")
 
 	running, err := runtime.ProjectImages(ctx, "", proj)
 	if err != nil {
@@ -326,7 +330,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, node string, opts Op
 	}
 	log.Info(reason, "running", describeImages(running), "desired", describeRefs(desiredRefs))
 
-	if err := runtime.Deploy(ctx, composeFile, proj, node, extraEnv); err != nil {
+	if err := runtime.Deploy(ctx, composeFile, proj, names.Node, extraEnv); err != nil {
 		return err
 	}
 	if err := runtime.WaitHealthy(ctx, proj, healthTimeout); err != nil {
@@ -347,8 +351,8 @@ func recreateProject(ctx context.Context, log *slog.Logger, node string, opts Op
 
 // blueGreenProject deploys a project into the idle color, waits for it to
 // become healthy, verifies its images, then stops the previously active color.
-func blueGreenProject(ctx context.Context, log *slog.Logger, node string, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
-	running, err := runningByColor(ctx, "", node, opts.Env, stack, project)
+func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
+	running, err := runningByColor(ctx, "", names, opts.Env, stack, project)
 	if err != nil {
 		return err
 	}
@@ -357,7 +361,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, node string, opts O
 	// any stale other color left behind by a prior switch. --force overrides.
 	if active := colorServing(running, desiredRefs); active != "" && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs), "color", active)
-		if err := stopOtherColors(ctx, log, node, opts.Env, stack, project, active, running); err != nil {
+		if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, active, running); err != nil {
 			return err
 		}
 		res.InSync++
@@ -365,7 +369,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, node string, opts O
 	}
 
 	target := runtime.OtherColor(currentColor(running))
-	targetProject := runtime.ProjectName(node, opts.Env, stack, project, target)
+	targetProject := names.Project(opts.Env, stack, project, target)
 
 	reason := "drift detected, deploying to idle color"
 	if opts.Force {
@@ -373,7 +377,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, node string, opts O
 	}
 	log.Info(reason, "running", describeColors(running), "desired", describeRefs(desiredRefs), "target_color", target)
 
-	if err := runtime.Deploy(ctx, composeFile, targetProject, node, extraEnv); err != nil {
+	if err := runtime.Deploy(ctx, composeFile, targetProject, names.Node, extraEnv); err != nil {
 		return err
 	}
 	log.Info("waiting for new color to become healthy", "color", target, "project", targetProject)
@@ -390,7 +394,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, node string, opts O
 	}
 	log.Info("new color healthy", "color", target, "images", describeRefs(desiredRefs))
 
-	if err := stopOtherColors(ctx, log, node, opts.Env, stack, project, target, running); err != nil {
+	if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, target, running); err != nil {
 		return err
 	}
 
@@ -429,10 +433,10 @@ func envVarName(service string) string {
 
 // runningByColor returns, for each Blue/Green color that has running
 // containers, the service->image map it serves.
-func runningByColor(ctx context.Context, host, node, env, stack, project string) (map[string]map[string]string, error) {
+func runningByColor(ctx context.Context, host string, names runtime.Names, env, stack, project string) (map[string]map[string]string, error) {
 	out := map[string]map[string]string{}
 	for _, color := range runtime.Colors {
-		proj := runtime.ProjectName(node, env, stack, project, color)
+		proj := names.Project(env, stack, project, color)
 		imgs, err := runtime.ProjectImages(ctx, host, proj)
 		if err != nil {
 			return nil, err
@@ -467,12 +471,12 @@ func currentColor(running map[string]map[string]string) string {
 }
 
 // stopOtherColors tears down every running color except keep.
-func stopOtherColors(ctx context.Context, log *slog.Logger, node, env, stack, project, keep string, running map[string]map[string]string) error {
+func stopOtherColors(ctx context.Context, log *slog.Logger, names runtime.Names, env, stack, project, keep string, running map[string]map[string]string) error {
 	for _, color := range runtime.Colors {
 		if color == keep || len(running[color]) == 0 {
 			continue
 		}
-		proj := runtime.ProjectName(node, env, stack, project, color)
+		proj := names.Project(env, stack, project, color)
 		log.Info("stopping old color", "color", color, "project", proj)
 		if err := runtime.Stop(ctx, proj); err != nil {
 			return err
@@ -605,11 +609,15 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 		}
 
 		for _, t := range targets {
+			names := runtime.Names{
+				Repo: r.Name, Node: t.node,
+				IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
+			}
 			for _, env := range statusEnvs(inv, t.node, opts.Env) {
 				if !inv.InEnv(t.node, env) {
 					continue
 				}
-				rows, err := statusEnv(ctx, dest, r.Name, t, env)
+				rows, err := statusEnv(ctx, dest, names, t, env)
 				if err != nil {
 					return out, err
 				}
@@ -622,24 +630,24 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 
 // statusEnv reports every service of every stack placed in one environment on
 // one node.
-func statusEnv(ctx context.Context, repoRoot, repoName string, t statusTarget, env string) ([]ServiceStatus, error) {
+func statusEnv(ctx context.Context, repoRoot string, names runtime.Names, t statusTarget, env string) ([]ServiceStatus, error) {
 	e, err := repo.LoadEnvironment(repoRoot, env)
 	if err != nil {
-		return nil, fmt.Errorf("repo %q env %q: %w", repoName, env, err)
+		return nil, fmt.Errorf("repo %q env %q: %w", names.Repo, env, err)
 	}
 
 	var out []ServiceStatus
 	for _, stackName := range e.Stacks {
 		stack, err := repo.LoadStack(repoRoot, stackName)
 		if err != nil {
-			return nil, fmt.Errorf("repo %q stack %q: %w", repoName, stackName, err)
+			return nil, fmt.Errorf("repo %q stack %q: %w", names.Repo, stackName, err)
 		}
 		state, err := repo.LoadStackState(repoRoot, env, stackName)
 		if err != nil {
-			return nil, fmt.Errorf("repo %q stack %q: %w", repoName, stackName, err)
+			return nil, fmt.Errorf("repo %q stack %q: %w", names.Repo, stackName, err)
 		}
 		for _, p := range stack.Projects {
-			rows, err := statusProject(ctx, t, repoName, env, stackName, p, state[p.Name])
+			rows, err := statusProject(ctx, t, names, env, stackName, p, state[p.Name])
 			if err != nil {
 				return nil, err
 			}
@@ -651,8 +659,8 @@ func statusEnv(ctx context.Context, repoRoot, repoName string, t statusTarget, e
 
 // statusProject reports every service of one project: the desired image, and a
 // row per running container (or a single missing row).
-func statusProject(ctx context.Context, t statusTarget, repoName, env, stack string, p repo.Project, desired map[string]repo.ServiceImage) ([]ServiceStatus, error) {
-	containers, err := projectContainers(ctx, t.dockerHost, t.node, env, stack, p)
+func statusProject(ctx context.Context, t statusTarget, names runtime.Names, env, stack string, p repo.Project, desired map[string]repo.ServiceImage) ([]ServiceStatus, error) {
+	containers, err := projectContainers(ctx, t.dockerHost, names, env, stack, p)
 	if err != nil {
 		return nil, fmt.Errorf("node %q: %w", t.node, err)
 	}
@@ -663,15 +671,15 @@ func statusProject(ctx context.Context, t statusTarget, repoName, env, stack str
 	}
 
 	// Report the union of declared (desired) and actually running services.
-	names := map[string]bool{}
+	serviceNames := map[string]bool{}
 	for svc := range desired {
-		names[svc] = true
+		serviceNames[svc] = true
 	}
 	for svc := range bySvc {
-		names[svc] = true
+		serviceNames[svc] = true
 	}
-	sorted := make([]string, 0, len(names))
-	for svc := range names {
+	sorted := make([]string, 0, len(serviceNames))
+	for svc := range serviceNames {
 		sorted = append(sorted, svc)
 	}
 	sort.Strings(sorted)
@@ -683,7 +691,7 @@ func statusProject(ctx context.Context, t statusTarget, repoName, env, stack str
 			desiredRef = si.Ref()
 		}
 		base := ServiceStatus{
-			Node: t.node, Repo: repoName, Env: env,
+			Node: t.node, Repo: names.Repo, Env: env,
 			Stack: stack, Project: p.Name, Service: svc, Desired: desiredRef,
 		}
 		cs := bySvc[svc]
@@ -705,14 +713,14 @@ func statusProject(ctx context.Context, t statusTarget, repoName, env, stack str
 
 // projectContainers lists a project's containers across the relevant compose
 // projects: both colors for Blue/Green, the single colorless project otherwise.
-func projectContainers(ctx context.Context, host, node, env, stack string, p repo.Project) ([]runtime.Container, error) {
+func projectContainers(ctx context.Context, host string, names runtime.Names, env, stack string, p repo.Project) ([]runtime.Container, error) {
 	if !p.BlueGreen() {
-		proj := runtime.ProjectName(node, env, stack, p.Name, "")
+		proj := names.Project(env, stack, p.Name, "")
 		return runtime.ProjectContainers(ctx, host, proj)
 	}
 	var all []runtime.Container
 	for _, color := range runtime.Colors {
-		proj := runtime.ProjectName(node, env, stack, p.Name, color)
+		proj := names.Project(env, stack, p.Name, color)
 		cs, err := runtime.ProjectContainers(ctx, host, proj)
 		if err != nil {
 			return nil, err

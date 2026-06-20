@@ -30,17 +30,54 @@ func OtherColor(color string) string {
 	return ColorBlue
 }
 
-// ProjectName builds a Docker Compose project name for one project of a stack.
-// It includes the node name so that multiple simulated nodes can run on a
-// single host during local testing without colliding. For Blue/Green projects
-// the color is appended; recreate projects pass an empty color and get no
-// suffix.
-func ProjectName(node, env, stack, project, color string) string {
-	base := fmt.Sprintf("kompensator-%s-%s-%s-%s", node, env, stack, project)
+// Names holds the segments that prefix a Docker Compose project name. Repo and
+// Node are optional (controlled by config) and let an operator shorten names,
+// e.g. drop the node segment when every node owns its own host. Node always
+// carries the real node name because it is also injected as NODE_NAME at deploy
+// time, independent of whether it appears in the project name.
+type Names struct {
+	Repo        string // deployment repo name
+	Node        string // node name (always used as NODE_NAME at deploy time)
+	IncludeRepo bool   // include Repo in the project name
+	IncludeNode bool   // include Node in the project name
+}
+
+// leadingSegments returns the optional repo/node segments that are enabled.
+func (n Names) leadingSegments() []string {
+	var parts []string
+	if n.IncludeRepo && n.Repo != "" {
+		parts = append(parts, n.Repo)
+	}
+	if n.IncludeNode && n.Node != "" {
+		parts = append(parts, n.Node)
+	}
+	return parts
+}
+
+// Project builds the Docker Compose project name for one project of a stack:
+//
+//	[<repo>-][<node>-]<env>-<stack>-<project>[-<color>]
+//
+// env, stack and project are always present; the color is appended for
+// Blue/Green projects and omitted (empty color) for recreate projects.
+func (n Names) Project(env, stack, project, color string) string {
+	parts := append(n.leadingSegments(), env, stack, project)
+	base := strings.Join(parts, "-")
 	if color != "" {
 		base += "-" + color
 	}
 	return sanitize(base)
+}
+
+// TeardownPrefix returns the project-name prefix that matches every project of
+// this node, or "" when neither repo nor node is part of the name (in which
+// case projects cannot be scoped to a single node).
+func (n Names) TeardownPrefix() string {
+	parts := n.leadingSegments()
+	if len(parts) == 0 {
+		return ""
+	}
+	return sanitize(strings.Join(parts, "-")) + "-"
 }
 
 // Container is one running (or stopped) container of a project's service.
@@ -183,7 +220,7 @@ func Down(ctx context.Context, host, project string) error {
 
 // ListProjects returns the distinct compose project names whose name starts
 // with prefix, on the given docker host ("" = local daemon). Used to find every
-// project belonging to a node (prefix "kompensator-<node>-").
+// project belonging to a node (see Names.TeardownPrefix).
 func ListProjects(ctx context.Context, host, prefix string) ([]string, error) {
 	out, err := output(ctx, "docker", dockerArgs(host,
 		"ps", "-a",

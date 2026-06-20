@@ -69,7 +69,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("resolve own binary: %w", err)
 	}
 
-	nodeCfg := config.Config{Node: config.Node{Name: opts.Name}, Repos: ctrlCfg.Repos}
+	nodeCfg := config.Config{Node: config.Node{Name: opts.Name}, Naming: ctrlCfg.Naming, Repos: ctrlCfg.Repos}
 	cfgData, err := config.Marshal(nodeCfg)
 	if err != nil {
 		return err
@@ -238,6 +238,10 @@ func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers
 	if name == "" {
 		return fmt.Errorf("node rm requires a node name")
 	}
+	cfg, err := config.Load(home)
+	if err != nil {
+		return err
+	}
 	r, dest, err := syncedRepo(ctx, home, repoName)
 	if err != nil {
 		return err
@@ -269,14 +273,23 @@ func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers
 	}
 
 	if !keepContainers {
-		projects, err := runtime.ListProjects(ctx, loc.DockerHost(), "kompensator-"+name+"-")
-		if err != nil {
-			return fmt.Errorf("list node projects: %w", err)
+		names := runtime.Names{
+			Repo: r.Name, Node: name,
+			IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
 		}
-		for _, p := range projects {
-			log.Info("tearing down project", "project", p)
-			if err := runtime.Down(ctx, loc.DockerHost(), p); err != nil {
-				return err
+		prefix := names.TeardownPrefix()
+		if prefix == "" {
+			log.Warn("naming includes neither repo nor node; cannot scope container teardown to this node, skipping", "node", name)
+		} else {
+			projects, err := runtime.ListProjects(ctx, loc.DockerHost(), prefix)
+			if err != nil {
+				return fmt.Errorf("list node projects: %w", err)
+			}
+			for _, p := range projects {
+				log.Info("tearing down project", "project", p)
+				if err := runtime.Down(ctx, loc.DockerHost(), p); err != nil {
+					return err
+				}
 			}
 		}
 	}
