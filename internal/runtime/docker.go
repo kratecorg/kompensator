@@ -171,6 +171,41 @@ func Stop(ctx context.Context, project string) error {
 	return nil
 }
 
+// Down tears down a compose project on a specific docker host ("" = local
+// daemon). Used when removing a node, to stop all of its projects.
+func Down(ctx context.Context, host, project string) error {
+	out, err := output(ctx, "docker", dockerArgs(host, "compose", "-p", project, "down")...)
+	if err != nil {
+		return fmt.Errorf("docker compose down (%s): %w: %s", project, err, out)
+	}
+	return nil
+}
+
+// ListProjects returns the distinct compose project names whose name starts
+// with prefix, on the given docker host ("" = local daemon). Used to find every
+// project belonging to a node (prefix "kompensator-<node>-").
+func ListProjects(ctx context.Context, host, prefix string) ([]string, error) {
+	out, err := output(ctx, "docker", dockerArgs(host,
+		"ps", "-a",
+		"--format", `{{.Label "com.docker.compose.project"}}`,
+	)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
+	}
+	seen := map[string]bool{}
+	var projects []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		p := strings.TrimSpace(line)
+		if p == "" || !strings.HasPrefix(p, prefix) || seen[p] {
+			continue
+		}
+		seen[p] = true
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	return projects, nil
+}
+
 // WaitHealthy blocks until every container of the project reports healthy, or
 // the timeout elapses. Containers without a healthcheck count as healthy as
 // soon as they are running, so plain images deploy without extra config while

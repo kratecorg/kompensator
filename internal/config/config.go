@@ -1,12 +1,16 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
+
+// configHeader is prepended to a generated config.yml.
+const configHeader = "# kompensator node-local config (managed by 'kompensator bootstrap').\n"
 
 // Config is the node-local configuration stored under the kompensator home
 // directory (config.yml). It identifies this node and the deployment repos it
@@ -18,6 +22,10 @@ import (
 type Config struct {
 	Node  Node   `yaml:"node"`
 	Repos []Repo `yaml:"repos"`
+	// Agent is the kompensator binary path a controller invokes on remote nodes
+	// over ssh (e.g. "/home/peter/.local/bin/kompensator" when it is not on the
+	// non-interactive ssh PATH). Empty defaults to "kompensator".
+	Agent string `yaml:"agent"`
 }
 
 // IsController reports whether this config is for a controller-only host, i.e.
@@ -92,4 +100,26 @@ func Load(home string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// Write creates (or overwrites) config.yml in home from cfg. It is used by
+// bootstrap to materialise a new node's local configuration.
+func Write(home string, cfg Config) error {
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return fmt.Errorf("create home dir: %w", err)
+	}
+	var buf bytes.Buffer
+	buf.WriteString(configHeader)
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(cfg); err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	enc.Close()
+
+	path := filepath.Join(home, "config.yml")
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }

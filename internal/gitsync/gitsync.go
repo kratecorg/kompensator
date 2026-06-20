@@ -65,6 +65,35 @@ func head(ctx context.Context, dest string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// CommitPush stages the given paths, commits them with a kompensator identity,
+// and pushes to origin/branch. It is a no-op (returns nil) when nothing is
+// staged. Unlike the read-only node agent, controller administration commands
+// use this to write inventory changes back to the deployment repo.
+func CommitPush(ctx context.Context, dir, branch, message string, paths ...string) error {
+	if branch == "" {
+		branch = "main"
+	}
+	if out, err := run(ctx, dir, "git", append([]string{"add"}, paths...)...); err != nil {
+		return fmt.Errorf("git add: %w: %s", err, out)
+	}
+	if out, err := run(ctx, dir, "git", "status", "--porcelain"); err != nil {
+		return fmt.Errorf("git status: %w: %s", err, out)
+	} else if strings.TrimSpace(out) == "" {
+		return nil // nothing changed
+	}
+	if out, err := run(ctx, dir, "git",
+		"-c", "user.name=kompensator",
+		"-c", "user.email=kompensator@localhost",
+		"commit", "-m", message,
+	); err != nil {
+		return fmt.Errorf("git commit: %w: %s", err, out)
+	}
+	if out, err := run(ctx, dir, "git", "push", "origin", branch); err != nil {
+		return fmt.Errorf("git push: %w: %s", err, out)
+	}
+	return nil
+}
+
 func run(ctx context.Context, dir, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if dir != "" {

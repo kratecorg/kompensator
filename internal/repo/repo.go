@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"fmt"
 	"net/url"
 	"os"
@@ -10,6 +11,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// inventoryHeader is prepended to a kompensator-managed inventory/nodes.yml.
+const inventoryHeader = "# Nodes and the environments they participate in (managed by kompensator).\n" +
+	"# location: an absolute path (local node) or ssh://[user@]host[:port]/path (remote).\n"
 
 // Deploy strategies for a project.
 const (
@@ -120,6 +125,75 @@ func (inv Inventory) EnvsForNode(node string) []string {
 	return nil
 }
 
+// index returns the position of the named node, or -1 if absent.
+func (inv *Inventory) index(name string) int {
+	for i := range inv.Nodes {
+		if inv.Nodes[i].Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// Has reports whether the named node exists in the inventory.
+func (inv *Inventory) Has(name string) bool {
+	return inv.index(name) >= 0
+}
+
+// AddNode appends a node. It errors if a node of that name already exists.
+func (inv *Inventory) AddNode(name, location string, envs []string) error {
+	if inv.index(name) >= 0 {
+		return fmt.Errorf("node %q already in inventory", name)
+	}
+	sorted := append([]string(nil), envs...)
+	sort.Strings(sorted)
+	inv.Nodes = append(inv.Nodes, Node{Name: name, Location: location, Environments: sorted})
+	return nil
+}
+
+// RemoveNode drops the named node, returning the removed entry.
+func (inv *Inventory) RemoveNode(name string) (Node, error) {
+	i := inv.index(name)
+	if i < 0 {
+		return Node{}, fmt.Errorf("node %q not in inventory", name)
+	}
+	n := inv.Nodes[i]
+	inv.Nodes = append(inv.Nodes[:i], inv.Nodes[i+1:]...)
+	return n, nil
+}
+
+// JoinEnv adds the node to an environment (no-op if already a member).
+func (inv *Inventory) JoinEnv(name, env string) error {
+	i := inv.index(name)
+	if i < 0 {
+		return fmt.Errorf("node %q not in inventory", name)
+	}
+	for _, e := range inv.Nodes[i].Environments {
+		if e == env {
+			return nil
+		}
+	}
+	inv.Nodes[i].Environments = append(inv.Nodes[i].Environments, env)
+	sort.Strings(inv.Nodes[i].Environments)
+	return nil
+}
+
+// LeaveEnv removes the node from an environment (no-op if not a member).
+func (inv *Inventory) LeaveEnv(name, env string) error {
+	i := inv.index(name)
+	if i < 0 {
+		return fmt.Errorf("node %q not in inventory", name)
+	}
+	out := make([]string, 0, len(inv.Nodes[i].Environments))
+	for _, e := range inv.Nodes[i].Environments {
+		if e != env {
+			out = append(out, e)
+		}
+	}
+	inv.Nodes[i].Environments = out
+	return nil
+}
+
 // Environment is a deployment target, stored at environments/<env>/env.yml. It
 // lists which stacks are deployed in this environment.
 type Environment struct {
@@ -174,6 +248,29 @@ func LoadInventory(repoRoot string) (Inventory, error) {
 		return Inventory{}, err
 	}
 	return inv, nil
+}
+
+// SaveInventory writes inventory/nodes.yml back to the repo, overwriting it
+// with a kompensator-managed, generated form (comments other than the header
+// are not preserved).
+func SaveInventory(repoRoot string, inv Inventory) error {
+	var buf bytes.Buffer
+	buf.WriteString(inventoryHeader)
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(inv); err != nil {
+		return fmt.Errorf("encode inventory: %w", err)
+	}
+	enc.Close()
+
+	path := filepath.Join(repoRoot, "inventory", "nodes.yml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create inventory dir: %w", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 // LoadEnvironment reads environments/<env>/env.yml.

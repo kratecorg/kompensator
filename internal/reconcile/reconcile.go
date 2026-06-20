@@ -136,7 +136,7 @@ func runController(ctx context.Context, log *slog.Logger, opts Options, cfg *con
 	for _, t := range targets {
 		nlog := clog.With("node", t.name)
 		nlog.Info("triggering node reconcile", "location", t.loc.Path, "remote", !t.loc.Local)
-		if err := triggerReconcile(ctx, t.loc, opts); err != nil {
+		if err := triggerReconcile(ctx, t.loc, opts, cfg.Agent); err != nil {
 			nlog.Error("node reconcile failed", "error", err)
 			failed++
 			continue
@@ -198,9 +198,9 @@ func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *
 
 // triggerReconcile runs the node agent for one node. A local node is reached by
 // re-executing this binary with the node's home; a remote node over ssh, where
-// the "kompensator" binary is expected on PATH. The agent's own logs stream to
-// the controller's stderr.
-func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) error {
+// the agent binary (agentBin, default "kompensator") must be reachable. The
+// agent's own logs stream to the controller's stderr.
+func triggerReconcile(ctx context.Context, loc repo.Location, opts Options, agentBin string) error {
 	global := []string{"-home", loc.Path}
 	if opts.JSONLog {
 		global = append(global, "-json")
@@ -219,6 +219,9 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 		}
 		cmd = exec.CommandContext(ctx, self, append(global, sub...)...)
 	} else {
+		if agentBin == "" {
+			agentBin = "kompensator"
+		}
 		sshArgs := []string{"-o", "BatchMode=yes"}
 		if loc.Port != "" {
 			sshArgs = append(sshArgs, "-p", loc.Port)
@@ -227,7 +230,7 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 		if loc.User != "" {
 			target = loc.User + "@" + loc.Host
 		}
-		remote := append([]string{"kompensator"}, append(global, sub...)...)
+		remote := append([]string{agentBin}, append(global, sub...)...)
 		sshArgs = append(sshArgs, target, strings.Join(remote, " "))
 		cmd = exec.CommandContext(ctx, "ssh", sshArgs...)
 	}
