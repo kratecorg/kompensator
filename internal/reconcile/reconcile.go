@@ -279,32 +279,23 @@ func (r *Result) add(o Result) {
 	r.Failed += o.Failed
 }
 
-// AppStatus is the desired vs. running state of one app on one node.
+// AppStatus is the desired state of one app on one node and, for each running
+// replica, the container that serves it. One AppStatus is emitted per running
+// container; an app with nothing running yields a single row with empty
+// Container/Running.
 type AppStatus struct {
-	Node    string
-	Repo    string
-	Env     string
-	App     string
-	Desired string // "image:tag", or "" if absent from deployment-state
-	Running string // "image:tag", or "" if not running
-	Color   string // active Blue/Green slot ("blue"/"green"), or "" if not running
+	Node      string
+	Repo      string
+	Env       string
+	App       string
+	Desired   string // "image:tag", or "" if absent from deployment-state
+	Color     string // Blue/Green slot of this container, or "" if not running
+	Container string // short container name, e.g. "web-2", or "" if not running
+	Running   string // "image:tag" of this container, or "" if not running
+	Health    string // docker's human status, e.g. "Up 2 minutes (healthy)"
 }
 
-// runningRef picks the image/color to report for status. It prefers the slot
-// serving the desired image; otherwise the first running slot.
-func runningRef(running []runtime.ColorState, desired string) (image, color string) {
-	for _, cs := range running {
-		if cs.Image == desired {
-			return cs.Image, cs.Color
-		}
-	}
-	if len(running) > 0 {
-		return running[0].Image, running[0].Color
-	}
-	return "", ""
-}
-
-// State summarises the app's status as a short word.
+// State summarises the row's status as a short word.
 func (s AppStatus) State() string {
 	switch {
 	case s.Desired == "":
@@ -373,16 +364,28 @@ func Status(ctx context.Context, opts Options) ([]AppStatus, error) {
 				}
 
 				for _, app := range apps {
-					st := AppStatus{Node: t.node, Repo: r.Name, Env: env, App: app.Name}
+					desired := ""
 					if d, ok := state[app.Name]; ok && d.Image != "" && d.Tag != "" {
-						st.Desired = d.Ref()
+						desired = d.Ref()
 					}
-					running, err := runtime.RunningColors(ctx, t.dockerHost, t.node, env, app.Name, app.Name)
+					containers, err := runtime.RunningContainers(ctx, t.dockerHost, t.node, env, app.Name, app.Name)
 					if err != nil {
 						return out, fmt.Errorf("node %q: %w", t.node, err)
 					}
-					st.Running, st.Color = runningRef(running, st.Desired)
-					out = append(out, st)
+
+					base := AppStatus{Node: t.node, Repo: r.Name, Env: env, App: app.Name, Desired: desired}
+					if len(containers) == 0 {
+						out = append(out, base)
+						continue
+					}
+					for _, c := range containers {
+						st := base
+						st.Color = c.Color
+						st.Container = c.Name
+						st.Running = c.Image
+						st.Health = c.Health
+						out = append(out, st)
+					}
 				}
 			}
 		}

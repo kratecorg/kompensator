@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -77,6 +78,88 @@ func RunningImage(ctx context.Context, dockerHost, project, service string) (str
 		return "", fmt.Errorf("docker ps: %w: %s", err, out)
 	}
 	return firstLine(out), nil
+}
+
+// Container is one running (or stopped) container of an app's service, in a
+// particular Blue/Green slot.
+type Container struct {
+	Color  string // "blue" / "green"
+	Name   string // short name, e.g. "web-2" (service + replica number)
+	Image  string // image reference it runs
+	Health string // concise health: healthy/starting/unhealthy/running/exited
+}
+
+// RunningContainers lists every container of the app's service across both
+// Blue/Green slots, one entry per replica. dockerHost is the docker "-H"
+// endpoint to query ("" = local daemon).
+func RunningContainers(ctx context.Context, dockerHost, node, env, app, service string) ([]Container, error) {
+	var all []Container
+	for _, color := range Colors {
+		project := ProjectName(node, env, app, color)
+		cs, err := containersFor(ctx, dockerHost, project, service)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cs {
+			c.Color = color
+			all = append(all, c)
+		}
+	}
+	return all, nil
+}
+
+// containersFor lists the containers of one compose project/service. The short
+// name is "<service>-<replica-number>" so it stays readable next to the
+// node/env/app/color columns that already encode the project.
+func containersFor(ctx context.Context, dockerHost, project, service string) ([]Container, error) {
+	const fmtStr = `{{.Label "com.docker.compose.service"}}-{{.Label "com.docker.compose.container-number"}}` +
+		"\t{{.Image}}\t{{.Status}}"
+	out, err := output(ctx, "docker", dockerArgs(dockerHost,
+		"ps", "-a",
+		"--filter", "label=com.docker.compose.project="+project,
+		"--filter", "label=com.docker.compose.service="+service,
+		"--format", fmtStr,
+	)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
+	}
+
+	var cs []Container
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		cs = append(cs, Container{Name: parts[0], Image: parts[1], Health: shortHealth(parts[2])})
+	}
+	sort.Slice(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
+	return cs, nil
+}
+
+// shortHealth reduces docker's human status string (e.g. "Up 2 minutes
+// (healthy)") to a single concise token for the status table.
+func shortHealth(status string) string {
+	switch {
+	case strings.Contains(status, "(healthy)"):
+		return "healthy"
+	case strings.Contains(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(status, "health: starting"):
+		return "starting"
+	case strings.HasPrefix(status, "Up"):
+		return "running"
+	case strings.HasPrefix(status, "Exited"), strings.HasPrefix(status, "Exit"):
+		return "exited"
+	case strings.HasPrefix(status, "Created"):
+		return "created"
+	case strings.HasPrefix(status, "Restarting"):
+		return "restarting"
+	default:
+		return strings.ToLower(firstLine(status))
+	}
 }
 
 // Deploy brings one Blue/Green slot up to the desired image/tag using Docker
