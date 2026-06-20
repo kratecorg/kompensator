@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -23,10 +24,11 @@ const healthTimeout = 5 * time.Minute
 
 // Options controls a reconcile run.
 type Options struct {
-	Home   string
-	Env    string
-	Force  bool // redeploy even when the desired image is already running
-	Logger *slog.Logger
+	Home    string
+	Env     string
+	Force   bool // redeploy even when the desired image is already running
+	JSONLog bool // pass -json through to node agents (controller mode)
+	Logger  *slog.Logger
 }
 
 // Result summarises a reconcile run.
@@ -37,16 +39,30 @@ type Result struct {
 	Failed   int
 }
 
-// Run performs a single reconcile pass for the node: sync each deployment repo,
-// resolve the apps placed on this node, and deploy any that have drifted from
-// the desired state. It is the core of Phase 1 and is invoked both by cron and
-// manually.
+// Run performs a reconcile. On a node agent (config has node.name) it does a
+// single local pass: sync each deployment repo, resolve the apps placed on
+// this node, and deploy any that have drifted. On a controller (config has no
+// node.name) it instead triggers each participating node's agent — locally by
+// re-executing itself with the node's home, or remotely over ssh.
 func Run(ctx context.Context, opts Options) (Result, error) {
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 
+	cfg, err := config.Load(opts.Home)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if cfg.IsController() {
+		return runController(ctx, log, opts, cfg)
+	}
+	return runNode(ctx, log, opts, cfg)
+}
+
+// runNode is the node-local reconcile pass (cron and manual entrypoint).
+func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) (Result, error) {
 	unlock, held, err := lock(opts.Home)
 	if err != nil {
 		return Result{}, err
@@ -56,14 +72,6 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		return Result{}, nil
 	}
 	defer unlock()
-
-	cfg, err := config.Load(opts.Home)
-	if err != nil {
-		return Result{}, err
-	}
-	if cfg.Node.Name == "" {
-		return Result{}, fmt.Errorf("reconcile requires node.name in %s/config.yml (this host is configured as a controller only)", opts.Home)
-	}
 
 	log = log.With("node", cfg.Node.Name, "env", opts.Env)
 	log.Info("reconcile started")
@@ -94,6 +102,137 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		return total, fmt.Errorf("%d app(s) failed to reconcile", total.Failed)
 	}
 	return total, nil
+}
+
+// runController triggers reconcile on every node that participates in the
+// environment. Nodes are processed one at a time so a Blue/Green rollout never
+// runs on two nodes simultaneously. A failure on one node is recorded and the
+// rest still run.
+func runController(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) (Result, error) {
+	unlock, held, err := lock(opts.Home)
+	if err != nil {
+		return Result{}, err
+	}
+	if !held {
+		log.Info("another controller run is in progress, skipping")
+		return Result{}, nil
+	}
+	defer unlock()
+
+	clog := log.With("controller", true, "env", opts.Env)
+	clog.Info("controller reconcile started")
+
+	targets, err := reconcileTargets(ctx, clog, opts, cfg)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(targets) == 0 {
+		clog.Info("no nodes participate in env")
+		return Result{}, nil
+	}
+
+	var failed int
+	for _, t := range targets {
+		nlog := clog.With("node", t.name)
+		nlog.Info("triggering node reconcile", "location", t.loc.Path, "remote", !t.loc.Local)
+		if err := triggerReconcile(ctx, t.loc, opts); err != nil {
+			nlog.Error("node reconcile failed", "error", err)
+			failed++
+			continue
+		}
+		nlog.Info("node reconcile ok")
+	}
+
+	clog.Info("controller reconcile finished", "nodes", len(targets), "failed", failed)
+	if failed > 0 {
+		return Result{Failed: failed}, fmt.Errorf("%d of %d node(s) failed to reconcile", failed, len(targets))
+	}
+	return Result{}, nil
+}
+
+// reconcileTarget is one node the controller will trigger.
+type reconcileTarget struct {
+	name string
+	loc  repo.Location
+}
+
+// reconcileTargets syncs the controller's repos and returns the nodes that
+// participate in the environment, deduplicated by name. Every such node must
+// declare a location so the controller can reach it.
+func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) ([]reconcileTarget, error) {
+	seen := map[string]bool{}
+	var targets []reconcileTarget
+	for _, r := range cfg.Repos {
+		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
+		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
+		if err != nil {
+			return nil, fmt.Errorf("sync repo %q: %w", r.Name, err)
+		}
+		log.Info("repo synced", "repo", r.Name, "commit", commit)
+
+		inv, err := repo.LoadInventory(dest)
+		if err != nil {
+			return nil, fmt.Errorf("repo %q: %w", r.Name, err)
+		}
+		for _, n := range inv.Nodes {
+			if _, ok := inv.RolesFor(n.Name, opts.Env); !ok {
+				continue // node not in this environment
+			}
+			if seen[n.Name] {
+				continue
+			}
+			if n.Location == "" {
+				return nil, fmt.Errorf("node %q has no location; controller cannot trigger reconcile", n.Name)
+			}
+			loc, err := repo.ParseLocation(n.Location)
+			if err != nil {
+				return nil, fmt.Errorf("node %q: %w", n.Name, err)
+			}
+			seen[n.Name] = true
+			targets = append(targets, reconcileTarget{name: n.Name, loc: loc})
+		}
+	}
+	return targets, nil
+}
+
+// triggerReconcile runs the node agent for one node. A local node is reached by
+// re-executing this binary with the node's home; a remote node over ssh, where
+// the "kompensator" binary is expected on PATH. The agent's own logs stream to
+// the controller's stderr.
+func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) error {
+	global := []string{"-home", loc.Path}
+	if opts.JSONLog {
+		global = append(global, "-json")
+	}
+	sub := []string{"reconcile"}
+	if opts.Force {
+		sub = append(sub, "--force")
+	}
+	sub = append(sub, opts.Env)
+
+	var cmd *exec.Cmd
+	if loc.Local {
+		self, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolve own binary: %w", err)
+		}
+		cmd = exec.CommandContext(ctx, self, append(global, sub...)...)
+	} else {
+		sshArgs := []string{"-o", "BatchMode=yes"}
+		if loc.Port != "" {
+			sshArgs = append(sshArgs, "-p", loc.Port)
+		}
+		target := loc.Host
+		if loc.User != "" {
+			target = loc.User + "@" + loc.Host
+		}
+		remote := append([]string{"kompensator"}, append(global, sub...)...)
+		sshArgs = append(sshArgs, target, strings.Join(remote, " "))
+		cmd = exec.CommandContext(ctx, "ssh", sshArgs...)
+	}
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func reconcileRepo(ctx context.Context, log *slog.Logger, node string, opts Options, repoRoot string) (Result, error) {

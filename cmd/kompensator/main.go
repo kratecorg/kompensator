@@ -85,10 +85,11 @@ func cmdReconcile(g globals, args []string) int {
 
 	log := newLogger(g.jsonLog)
 	if _, err := reconcile.Run(ctx, reconcile.Options{
-		Home:   h,
-		Env:    env,
-		Force:  *force,
-		Logger: log,
+		Home:    h,
+		Env:     env,
+		Force:   *force,
+		JSONLog: g.jsonLog,
+		Logger:  log,
 	}); err != nil {
 		log.Error("reconcile failed", "error", err)
 		return 1
