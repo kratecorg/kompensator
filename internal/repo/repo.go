@@ -2,9 +2,11 @@ package repo
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,8 +20,66 @@ type Inventory struct {
 // Node is one host in the inventory. A node can participate in multiple
 // environments, and within each environment hold multiple roles.
 type Node struct {
-	Name         string                `yaml:"name"`
+	Name string `yaml:"name"`
+	// Location tells a controller how to reach the node's kompensator home.
+	// It is either an absolute filesystem path (the node is local / directly
+	// accessible) or an ssh URL "ssh://[user@]host[:port]/path". The path is
+	// the node's KOMPENSATOR_HOME, kept for remote agent operations; the docker
+	// status is read from the derived endpoint (local daemon or ssh://).
+	Location     string                `yaml:"location"`
 	Environments map[string]Membership `yaml:"environments"`
+}
+
+// Location describes how a controller reaches a node.
+type Location struct {
+	Local bool   // true when the node shares the controller's host / filesystem
+	Path  string // KOMPENSATOR_HOME on the node
+	User  string // ssh user (remote only)
+	Host  string // ssh host (remote only)
+	Port  string // ssh port (remote only, may be empty)
+}
+
+// ParseLocation parses a node location string. An absolute path is a local
+// node; an "ssh://[user@]host[:port]/path" URL is a remote node.
+func ParseLocation(raw string) (Location, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return Location{}, fmt.Errorf("empty location")
+	}
+	if strings.HasPrefix(raw, "ssh://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return Location{}, fmt.Errorf("parse ssh location %q: %w", raw, err)
+		}
+		if u.Hostname() == "" {
+			return Location{}, fmt.Errorf("ssh location %q has no host", raw)
+		}
+		loc := Location{Host: u.Hostname(), Port: u.Port(), Path: u.Path}
+		if u.User != nil {
+			loc.User = u.User.Username()
+		}
+		return loc, nil
+	}
+	if filepath.IsAbs(raw) {
+		return Location{Local: true, Path: raw}, nil
+	}
+	return Location{}, fmt.Errorf("location %q must be an absolute path or an ssh:// URL", raw)
+}
+
+// DockerHost returns the docker "-H" endpoint for the node, or "" for a local
+// node (use the local daemon, disambiguated by compose project name).
+func (l Location) DockerHost() string {
+	if l.Local {
+		return ""
+	}
+	host := l.Host
+	if l.User != "" {
+		host = l.User + "@" + host
+	}
+	if l.Port != "" {
+		host = host + ":" + l.Port
+	}
+	return "ssh://" + host
 }
 
 // Membership describes a node's participation in one environment.

@@ -25,6 +25,7 @@ const healthTimeout = 5 * time.Minute
 type Options struct {
 	Home   string
 	Env    string
+	Force  bool // redeploy even when the desired image is already running
 	Logger *slog.Logger
 }
 
@@ -59,6 +60,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	cfg, err := config.Load(opts.Home)
 	if err != nil {
 		return Result{}, err
+	}
+	if cfg.Node.Name == "" {
+		return Result{}, fmt.Errorf("reconcile requires node.name in %s/config.yml (this host is configured as a controller only)", opts.Home)
 	}
 
 	log = log.With("node", cfg.Node.Name, "env", opts.Env)
@@ -159,14 +163,15 @@ func reconcileApp(ctx context.Context, log *slog.Logger, node string, opts Optio
 	}
 	desiredRef := desired.Ref()
 
-	running, err := runtime.RunningColors(ctx, node, opts.Env, app.Name, app.Name)
+	running, err := runtime.RunningColors(ctx, "", node, opts.Env, app.Name, app.Name)
 	if err != nil {
 		return err
 	}
 
 	// If a running slot already serves the desired image, we are in sync. Stop
 	// any other (stale) slot that may have been left behind by a prior switch.
-	if active, ok := colorServing(running, desiredRef); ok {
+	// --force overrides this and triggers a fresh deploy into the idle slot.
+	if active, ok := colorServing(running, desiredRef); ok && !opts.Force {
 		alog.Info("in sync", "image", desiredRef, "color", active)
 		if err := stopOtherColors(ctx, alog, node, opts.Env, app.Name, active, running); err != nil {
 			return err
@@ -181,7 +186,11 @@ func reconcileApp(ctx context.Context, log *slog.Logger, node string, opts Optio
 	target := runtime.OtherColor(currentColor(running))
 	targetProject := runtime.ProjectName(node, opts.Env, app.Name, target)
 
-	alog.Info("drift detected, deploying to idle color",
+	reason := "drift detected, deploying to idle color"
+	if opts.Force {
+		reason = "force redeploy to idle color"
+	}
+	alog.Info(reason,
 		"running", describeColors(running),
 		"desired", desiredRef,
 		"target_color", target,
@@ -198,7 +207,7 @@ func reconcileApp(ctx context.Context, log *slog.Logger, node string, opts Optio
 	}
 
 	// Verify the new slot actually serves the desired image before cutting over.
-	got, err := runtime.RunningImage(ctx, targetProject, app.Name)
+	got, err := runtime.RunningImage(ctx, "", targetProject, app.Name)
 	if err != nil {
 		return err
 	}
@@ -270,8 +279,9 @@ func (r *Result) add(o Result) {
 	r.Failed += o.Failed
 }
 
-// AppStatus is the desired vs. running state of one app on this node.
+// AppStatus is the desired vs. running state of one app on one node.
 type AppStatus struct {
+	Node    string
 	Repo    string
 	Env     string
 	App     string
@@ -308,13 +318,15 @@ func (s AppStatus) State() string {
 	}
 }
 
-// Status collects the desired vs. running state for every app placed on this
-// node, without changing anything. It refreshes the repo(s) first when no
-// reconcile is currently running; if one is, it reports the last-synced state
-// to avoid interfering.
+// Status collects the desired vs. running state for apps, without changing
+// anything. It refreshes the repo(s) first when no reconcile is currently
+// running; if one is, it reports the last-synced state to avoid interfering.
 //
-// When opts.Env is empty, every environment the node participates in is
-// reported; otherwise only the named environment.
+// When the inventory declares node locations, Status acts as a controller and
+// aggregates every node (querying each node's docker daemon via its location).
+// Otherwise it reports only this node, against the local daemon. When opts.Env
+// is empty, every environment a node participates in is reported; otherwise
+// only the named environment.
 func Status(ctx context.Context, opts Options) ([]AppStatus, error) {
 	cfg, err := config.Load(opts.Home)
 	if err != nil {
@@ -339,49 +351,98 @@ func Status(ctx context.Context, opts Options) ([]AppStatus, error) {
 			}
 		}
 
-		envs, err := statusEnvs(dest, cfg.Node.Name, opts.Env)
+		inv, err := repo.LoadInventory(dest)
 		if err != nil {
 			return out, fmt.Errorf("repo %q: %w", r.Name, err)
 		}
 
-		for _, env := range envs {
-			apps, state, _, member, err := resolve(dest, cfg.Node.Name, env)
-			if err != nil {
-				return out, fmt.Errorf("repo %q env %q: %w", r.Name, env, err)
-			}
-			if !member {
-				continue
-			}
+		targets, err := statusTargets(inv, cfg.Node.Name)
+		if err != nil {
+			return out, fmt.Errorf("repo %q: %w", r.Name, err)
+		}
 
-			for _, app := range apps {
-				st := AppStatus{Repo: r.Name, Env: env, App: app.Name}
-				if d, ok := state[app.Name]; ok && d.Image != "" && d.Tag != "" {
-					st.Desired = d.Ref()
-				}
-				running, err := runtime.RunningColors(ctx, cfg.Node.Name, env, app.Name, app.Name)
+		for _, t := range targets {
+			envs := statusEnvs(inv, t.node, opts.Env)
+			for _, env := range envs {
+				apps, state, _, member, err := resolve(dest, t.node, env)
 				if err != nil {
-					return out, err
+					return out, fmt.Errorf("repo %q node %q env %q: %w", r.Name, t.node, env, err)
 				}
-				st.Running, st.Color = runningRef(running, st.Desired)
-				out = append(out, st)
+				if !member {
+					continue
+				}
+
+				for _, app := range apps {
+					st := AppStatus{Node: t.node, Repo: r.Name, Env: env, App: app.Name}
+					if d, ok := state[app.Name]; ok && d.Image != "" && d.Tag != "" {
+						st.Desired = d.Ref()
+					}
+					running, err := runtime.RunningColors(ctx, t.dockerHost, t.node, env, app.Name, app.Name)
+					if err != nil {
+						return out, fmt.Errorf("node %q: %w", t.node, err)
+					}
+					st.Running, st.Color = runningRef(running, st.Desired)
+					out = append(out, st)
+				}
 			}
 		}
 	}
 	return out, nil
 }
 
-// statusEnvs returns the environments to report for a repo. When env is set it
-// is used as-is; otherwise all envs the node participates in (per the repo's
+// statusTarget is one node to report on, with the docker endpoint to query.
+type statusTarget struct {
+	node       string
+	dockerHost string // "" = local daemon
+}
+
+// statusTargets decides which nodes to report. When the inventory declares
+// node locations we are a controller: report every node, querying each via its
+// location's docker endpoint (the self node, matching selfNode, uses the local
+// daemon to avoid an ssh hop to itself). Without locations we report only the
+// configured node against the local daemon (legacy single-node behaviour).
+func statusTargets(inv repo.Inventory, selfNode string) ([]statusTarget, error) {
+	hasLocations := false
+	for _, n := range inv.Nodes {
+		if n.Location != "" {
+			hasLocations = true
+			break
+		}
+	}
+
+	if !hasLocations {
+		if selfNode == "" {
+			return nil, fmt.Errorf("no node locations in inventory and no node.name in config: nothing to report")
+		}
+		return []statusTarget{{node: selfNode}}, nil
+	}
+
+	targets := make([]statusTarget, 0, len(inv.Nodes))
+	for _, n := range inv.Nodes {
+		if n.Location == "" {
+			return nil, fmt.Errorf("node %q has no location (all or no nodes must declare one)", n.Name)
+		}
+		loc, err := repo.ParseLocation(n.Location)
+		if err != nil {
+			return nil, fmt.Errorf("node %q: %w", n.Name, err)
+		}
+		host := loc.DockerHost()
+		if n.Name == selfNode {
+			host = "" // we are this node: query the local daemon directly
+		}
+		targets = append(targets, statusTarget{node: n.Name, dockerHost: host})
+	}
+	return targets, nil
+}
+
+// statusEnvs returns the environments to report for a node. When env is set it
+// is used as-is; otherwise all envs the node participates in (per the
 // inventory) are returned.
-func statusEnvs(repoRoot, node, env string) ([]string, error) {
+func statusEnvs(inv repo.Inventory, node, env string) []string {
 	if env != "" {
-		return []string{env}, nil
+		return []string{env}
 	}
-	inv, err := repo.LoadInventory(repoRoot)
-	if err != nil {
-		return nil, err
-	}
-	return inv.EnvsForNode(node), nil
+	return inv.EnvsForNode(node)
 }
 
 // lock takes an exclusive, non-blocking flock on <home>/kompensator.lock so a

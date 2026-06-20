@@ -58,12 +58,21 @@ func main() {
 }
 
 func cmdReconcile(g globals, args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile <env>")
+	fs := flag.NewFlagSet("reconcile", flag.ContinueOnError)
+	force := fs.Bool("force", false, "redeploy even when the desired image is already running")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] <env>")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
 		fmt.Fprintln(os.Stderr, "  <env> is required.")
 		return 2
 	}
-	env := args[0]
+	env := fs.Arg(0)
 
 	h, err := resolveHome(g.home)
 	if err != nil {
@@ -78,6 +87,7 @@ func cmdReconcile(g globals, args []string) int {
 	if _, err := reconcile.Run(ctx, reconcile.Options{
 		Home:   h,
 		Env:    env,
+		Force:  *force,
 		Logger: log,
 	}); err != nil {
 		log.Error("reconcile failed", "error", err)
@@ -121,13 +131,13 @@ func cmdStatus(g globals, args []string) int {
 
 	drift := 0
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "ENV\tAPP\tCOLOR\tTARGET\tRUNNING\tSTATUS")
+	fmt.Fprintln(tw, "NODE\tENV\tAPP\tCOLOR\tTARGET\tRUNNING\tSTATUS")
 	for _, s := range statuses {
 		state := s.State()
 		if state == "drift" || state == "missing" {
 			drift++
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Env, s.App, dash(s.Color), dash(s.Desired), dash(s.Running), state)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", dash(s.Node), s.Env, s.App, dash(s.Color), dash(s.Desired), dash(s.Running), state)
 	}
 	tw.Flush()
 
@@ -172,6 +182,7 @@ Global flags (must come before the command):
 
 Commands:
   reconcile <env>   Pull deployment repo(s) and deploy on drift (env required)
+                    --force  redeploy even when already in sync
   status [env]      Show target vs. running images; no env shows all environments
   version           Print version
   help              Show this help

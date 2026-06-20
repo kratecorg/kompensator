@@ -46,12 +46,13 @@ type ColorState struct {
 // RunningColors reports which Blue/Green slots currently have a running
 // container for the app's service, together with the image each one serves.
 // The result has at most two entries (blue, green) and is empty when nothing
-// is running.
-func RunningColors(ctx context.Context, node, env, app, service string) ([]ColorState, error) {
+// is running. dockerHost is the docker "-H" endpoint to query ("" = local
+// daemon); a controller passes a node's ssh:// endpoint here.
+func RunningColors(ctx context.Context, dockerHost, node, env, app, service string) ([]ColorState, error) {
 	var states []ColorState
 	for _, color := range Colors {
 		project := ProjectName(node, env, app, color)
-		image, err := RunningImage(ctx, project, service)
+		image, err := RunningImage(ctx, dockerHost, project, service)
 		if err != nil {
 			return nil, err
 		}
@@ -63,13 +64,15 @@ func RunningColors(ctx context.Context, node, env, app, service string) ([]Color
 }
 
 // RunningImage returns the image reference of the running container for the
-// given compose project/service, or "" if none is running.
-func RunningImage(ctx context.Context, project, service string) (string, error) {
-	out, err := output(ctx, "docker", "ps",
+// given compose project/service, or "" if none is running. dockerHost is the
+// docker "-H" endpoint to query ("" = local daemon).
+func RunningImage(ctx context.Context, dockerHost, project, service string) (string, error) {
+	out, err := output(ctx, "docker", dockerArgs(dockerHost,
+		"ps",
 		"--filter", "label=com.docker.compose.project="+project,
 		"--filter", "label=com.docker.compose.service="+service,
 		"--format", "{{.Image}}",
-	)
+	)...)
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w: %s", err, out)
 	}
@@ -187,6 +190,15 @@ func containerHealthy(ctx context.Context, id string) (bool, error) {
 func output(ctx context.Context, name string, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return string(out), err
+}
+
+// dockerArgs prepends "-H <host>" to a docker invocation when host is set, so
+// the same command can target a local or a remote (ssh://) daemon.
+func dockerArgs(host string, args ...string) []string {
+	if host == "" {
+		return args
+	}
+	return append([]string{"-H", host}, args...)
 }
 
 func firstLine(s string) string {

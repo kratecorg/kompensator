@@ -11,9 +11,19 @@ import (
 // Config is the node-local configuration stored under the kompensator home
 // directory (config.yml). It identifies this node and the deployment repos it
 // follows. It never contains secrets.
+//
+// node.name is optional: a host that only acts as a controller (aggregating
+// the status of all nodes from a checked-out deployment repo) leaves it empty.
+// A reconcile agent, by contrast, requires node.name.
 type Config struct {
 	Node  Node   `yaml:"node"`
 	Repos []Repo `yaml:"repos"`
+}
+
+// IsController reports whether this config is for a controller-only host, i.e.
+// one that has no node identity of its own and only aggregates node status.
+func (c *Config) IsController() bool {
+	return c.Node.Name == ""
 }
 
 // Node identifies this machine within a deployment repo's inventory.
@@ -66,9 +76,8 @@ func Load(home string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
-	if cfg.Node.Name == "" {
-		return nil, fmt.Errorf("config %s: node.name is required", path)
-	}
+	// node.name is optional (a controller-only host has none). When present, a
+	// reconcile run uses it; Run enforces that it is set.
 	if len(cfg.Repos) == 0 {
 		return nil, fmt.Errorf("config %s: at least one repo is required", path)
 	}
