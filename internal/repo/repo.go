@@ -95,6 +95,22 @@ func (l Location) DockerHost() string {
 	return "ssh://" + host
 }
 
+// String renders the location back into its canonical form: an absolute path
+// for a local node, or "ssh://[user@]host[:port]/path" for a remote one.
+func (l Location) String() string {
+	if l.Local {
+		return l.Path
+	}
+	host := l.Host
+	if l.User != "" {
+		host = l.User + "@" + host
+	}
+	if l.Port != "" {
+		host = host + ":" + l.Port
+	}
+	return "ssh://" + host + l.Path
+}
+
 // InEnv reports whether the named node participates in the environment.
 func (inv Inventory) InEnv(node, env string) bool {
 	for _, n := range inv.Nodes {

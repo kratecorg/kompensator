@@ -98,23 +98,33 @@ func Load(home string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Marshal renders cfg as the byte content of a config.yml (header + YAML). It
+// is shared by Write (local) and by the controller when provisioning a remote
+// node's config over ssh.
+func Marshal(cfg Config) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteString(configHeader)
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(cfg); err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+	enc.Close()
+	return buf.Bytes(), nil
+}
+
 // Write creates (or overwrites) config.yml in home from cfg. It is used by
 // bootstrap to materialise a new node's local configuration.
 func Write(home string, cfg Config) error {
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		return fmt.Errorf("create home dir: %w", err)
 	}
-	var buf bytes.Buffer
-	buf.WriteString(configHeader)
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(cfg); err != nil {
-		return fmt.Errorf("encode config: %w", err)
+	data, err := Marshal(cfg)
+	if err != nil {
+		return err
 	}
-	enc.Close()
-
 	path := filepath.Join(home, "config.yml")
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

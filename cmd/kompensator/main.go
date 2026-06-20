@@ -48,8 +48,6 @@ func main() {
 		os.Exit(cmdReconcile(g, rest))
 	case "status":
 		os.Exit(cmdStatus(g, rest))
-	case "bootstrap":
-		os.Exit(cmdBootstrap(g, rest))
 	case "node":
 		os.Exit(cmdNode(g, rest))
 	case "version":
@@ -164,15 +162,6 @@ func resolveHome(home string) (string, error) {
 	return config.Home()
 }
 
-// multiFlag collects a repeatable string flag.
-type multiFlag []string
-
-func (m *multiFlag) String() string { return strings.Join(*m, ",") }
-func (m *multiFlag) Set(v string) error {
-	*m = append(*m, v)
-	return nil
-}
-
 // splitCSV splits a comma-separated list into trimmed, non-empty items.
 func splitCSV(s string) []string {
 	var out []string
@@ -184,44 +173,26 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// parseRepoSpec parses "name=url[,branch=main]".
-func parseRepoSpec(s string) (config.Repo, error) {
-	name, rest, ok := strings.Cut(s, "=")
-	if !ok || name == "" || rest == "" {
-		return config.Repo{}, fmt.Errorf("invalid --repo %q (want name=url[,branch=main])", s)
-	}
-	url, branch := rest, ""
-	if u, b, ok := strings.Cut(rest, ",branch="); ok {
-		url, branch = u, b
-	}
-	return config.Repo{Name: name, URL: url, Branch: branch}, nil
-}
-
-func cmdBootstrap(g globals, args []string) int {
-	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
+// cmdNodeBootstrap provisions a new node from the controller: it copies the
+// kompensator binary, writes the node config (repos copied from the controller
+// config), clones the repo(s) on the node and registers it in the inventory.
+func cmdNodeBootstrap(g globals, args []string) int {
+	fs := flag.NewFlagSet("node bootstrap", flag.ContinueOnError)
 	name := fs.String("name", "", "node name in the inventory")
-	location := fs.String("location", "", "node location (default: the home path); ssh://[user@]host[:port]/path for remote")
-	envCSV := fs.String("env", "", "comma-separated environments to join")
+	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
+	envCSV := fs.String("env", "", "comma-separated environments to attach immediately (optional)")
 	invRepo := fs.String("repo-inventory", "", "which repo's inventory to register in (default: the sole repo)")
-	noRegister := fs.Bool("no-register", false, "only create the local home (config + clone); do not push to the inventory (for read-only nodes)")
-	var repos multiFlag
-	fs.Var(&repos, "repo", "deployment repo as name=url[,branch=main] (repeatable)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator -home <dir> bootstrap --name <node> --repo name=url[,branch=main] [--location <loc>] [--env e1,e2]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node bootstrap --name <node> --location <loc> [--env e1,e2]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
 		return 2
 	}
-
-	var rs []config.Repo
-	for _, spec := range repos {
-		r, err := parseRepoSpec(spec)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			return 2
-		}
-		rs = append(rs, r)
+	// Allow the name to be given positionally too: node bootstrap <name> --location ...
+	if *name == "" {
+		*name = arg(pos, 0)
 	}
 
 	h, err := resolveHome(g.home)
@@ -234,17 +205,15 @@ func cmdBootstrap(g globals, args []string) int {
 	defer stop()
 
 	log := newLogger(g.jsonLog)
-	if err := admin.Bootstrap(ctx, admin.BootstrapOptions{
-		Home:          h,
-		Name:          *name,
-		Location:      *location,
-		Repos:         rs,
-		Envs:          splitCSV(*envCSV),
-		InventoryRepo: *invRepo,
-		NoRegister:    *noRegister,
-		Logger:        log,
+	if err := admin.ProvisionNode(ctx, admin.ProvisionOptions{
+		ControllerHome: h,
+		Name:           *name,
+		Location:       *location,
+		Envs:           splitCSV(*envCSV),
+		InventoryRepo:  *invRepo,
+		Logger:         log,
 	}); err != nil {
-		log.Error("bootstrap failed", "error", err)
+		log.Error("node bootstrap failed", "error", err)
 		return 1
 	}
 	return 0
@@ -252,58 +221,23 @@ func cmdBootstrap(g globals, args []string) int {
 
 func cmdNode(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <add|rm|join|leave> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <bootstrap|add|leave|rm> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
-	case "add":
-		return cmdNodeAdd(g, rest)
-	case "rm", "remove":
-		return cmdNodeRemove(g, rest)
-	case "join":
+	case "bootstrap":
+		return cmdNodeBootstrap(g, rest)
+	case "add", "join":
 		return cmdNodeSetEnv(g, rest, true)
 	case "leave":
 		return cmdNodeSetEnv(g, rest, false)
+	case "rm", "remove":
+		return cmdNodeRemove(g, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown node subcommand: %s\n", sub)
 		return 2
 	}
-}
-
-func cmdNodeAdd(g globals, args []string) int {
-	fs := flag.NewFlagSet("node add", flag.ContinueOnError)
-	location := fs.String("location", "", "node location (absolute path or ssh://[user@]host[:port]/path)")
-	envCSV := fs.String("env", "", "comma-separated environments to join")
-	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node add <name> --location <loc> [--env e1,e2] [--repo <name>]")
-		fs.PrintDefaults()
-	}
-	pos, err := parseFlagsAndArgs(fs, args)
-	if err != nil {
-		return 2
-	}
-	name := arg(pos, 0)
-	if name == "" {
-		fs.Usage()
-		return 2
-	}
-
-	h, err := resolveHome(g.home)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	log := newLogger(g.jsonLog)
-	if err := admin.NodeAdd(ctx, h, *repoName, name, *location, splitCSV(*envCSV), log); err != nil {
-		log.Error("node add failed", "error", err)
-		return 1
-	}
-	return 0
 }
 
 func cmdNodeRemove(g globals, args []string) int {
@@ -344,7 +278,7 @@ func cmdNodeRemove(g globals, args []string) int {
 func cmdNodeSetEnv(g globals, args []string, join bool) int {
 	verb := "leave"
 	if join {
-		verb = "join"
+		verb = "add"
 	}
 	fs := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
 	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
@@ -432,14 +366,14 @@ Commands:
   reconcile <env>   Pull deployment repo(s) and deploy on drift (env required)
                     --force  redeploy even when already in sync
   status [env]      Show target vs. running images; no env shows all environments
-  bootstrap         Create a new node: write its config, clone the repo(s) and
-                    register it in the inventory
-                    --name <node> --repo name=url[,branch=main] [--location <loc>] [--env e1,e2]
-  node add <name>   Register an existing node in the inventory (--location required)
+  node bootstrap    Provision a new node from the controller: copy the binary,
+                    write its config (repos from the controller), clone the
+                    repo(s) on it and register it in the inventory
+                    --name <node> --location <loc> [--env e1,e2]
+  node add <name> <env>     Attach a node to an environment
+  node leave <name> <env>   Detach a node from an environment
   node rm <name>    Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
-  node join <name> <env>    Add a node to an environment
-  node leave <name> <env>   Remove a node from an environment
   version           Print version
   help              Show this help
 
@@ -447,9 +381,9 @@ Examples:
   kompensator reconcile dev
   kompensator -json reconcile dev
   kompensator status
-  kompensator -home /opt/kompensator status dev
-  kompensator -home /opt/node4 bootstrap --name node-4 --repo deployment-repo=git@host:acme/deploy.git --env dev
-  kompensator node join node-4 preprod
-  kompensator node rm node-4
+  kompensator -home /opt/controller status dev
+  kompensator -home /opt/controller node bootstrap --name node7 --location ssh://peter@host.example.org
+  kompensator -home /opt/controller node add node7 dev
+  kompensator -home /opt/controller node rm node7
 `)
 }
