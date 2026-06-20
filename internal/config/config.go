@@ -22,10 +22,6 @@ const configHeader = "# kompensator node-local config (managed by 'kompensator b
 type Config struct {
 	Node  Node   `yaml:"node"`
 	Repos []Repo `yaml:"repos"`
-	// Agent is the kompensator binary path a controller invokes on remote nodes
-	// over ssh (e.g. "/home/peter/.local/bin/kompensator" when it is not on the
-	// non-interactive ssh PATH). Empty defaults to "kompensator".
-	Agent string `yaml:"agent"`
 }
 
 // IsController reports whether this config is for a controller-only host, i.e.
