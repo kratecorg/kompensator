@@ -132,14 +132,14 @@ func cmdStatus(g globals, args []string) int {
 
 	drift := 0
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tENV\tAPP\tCOLOR\tCONTAINER\tTARGET\tRUNNING\tHEALTH\tSTATUS")
+	fmt.Fprintln(tw, "NODE\tENV\tSTACK\tPROJECT\tSERVICE\tCOLOR\tCONTAINER\tTARGET\tRUNNING\tHEALTH\tSTATUS")
 	for _, s := range statuses {
 		state := s.State()
 		if state == "drift" || state == "missing" {
 			drift++
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			dash(s.Node), s.Env, s.App, dash(s.Color), dash(s.Container),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			dash(s.Node), s.Env, s.Stack, s.Project, s.Service, dash(s.Color), dash(s.Container),
 			dash(s.Desired), dash(s.Running), dash(s.Health), state)
 	}
 	tw.Flush()

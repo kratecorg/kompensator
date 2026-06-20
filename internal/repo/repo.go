@@ -11,14 +11,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Inventory is the set of nodes and their per-environment roles, stored at
-// inventory/nodes.yml in the deployment repo.
+// Deploy strategies for a project.
+const (
+	StrategyBlueGreen = "blue-green"
+	StrategyRecreate  = "recreate"
+)
+
+// Inventory is the set of nodes and the environments they participate in,
+// stored at inventory/nodes.yml in the deployment repo.
 type Inventory struct {
 	Nodes []Node `yaml:"nodes"`
 }
 
-// Node is one host in the inventory. A node can participate in multiple
-// environments, and within each environment hold multiple roles.
+// Node is one host in the inventory. A node participates in a set of
+// environments and runs every stack (and project) placed in those
+// environments; there are no roles.
 type Node struct {
 	Name string `yaml:"name"`
 	// Location tells a controller how to reach the node's kompensator home.
@@ -26,8 +33,9 @@ type Node struct {
 	// accessible) or an ssh URL "ssh://[user@]host[:port]/path". The path is
 	// the node's KOMPENSATOR_HOME, kept for remote agent operations; the docker
 	// status is read from the derived endpoint (local daemon or ssh://).
-	Location     string                `yaml:"location"`
-	Environments map[string]Membership `yaml:"environments"`
+	Location string `yaml:"location"`
+	// Environments this node participates in.
+	Environments []string `yaml:"environments"`
 }
 
 // Location describes how a controller reaches a node.
@@ -82,25 +90,20 @@ func (l Location) DockerHost() string {
 	return "ssh://" + host
 }
 
-// Membership describes a node's participation in one environment.
-type Membership struct {
-	Roles []string `yaml:"roles"`
-}
-
-// RolesFor returns the roles the named node holds in the given environment and
-// whether the node participates in that environment at all.
-func (inv Inventory) RolesFor(node, env string) ([]string, bool) {
+// InEnv reports whether the named node participates in the environment.
+func (inv Inventory) InEnv(node, env string) bool {
 	for _, n := range inv.Nodes {
 		if n.Name != node {
 			continue
 		}
-		m, ok := n.Environments[env]
-		if !ok {
-			return nil, false
+		for _, e := range n.Environments {
+			if e == env {
+				return true
+			}
 		}
-		return m.Roles, true
+		return false
 	}
-	return nil, false
+	return false
 }
 
 // EnvsForNode returns the sorted list of environments the named node
@@ -110,45 +113,59 @@ func (inv Inventory) EnvsForNode(node string) []string {
 		if n.Name != node {
 			continue
 		}
-		envs := make([]string, 0, len(n.Environments))
-		for env := range n.Environments {
-			envs = append(envs, env)
-		}
+		envs := append([]string(nil), n.Environments...)
 		sort.Strings(envs)
 		return envs
 	}
 	return nil
 }
 
-// Placement declares which apps run where, stored at
-// environments/<env>/placement.yml.
-type Placement struct {
-	Apps []App `yaml:"apps"`
+// Environment is a deployment target, stored at environments/<env>/env.yml. It
+// lists which stacks are deployed in this environment.
+type Environment struct {
+	Name   string   `yaml:"name"`
+	Stacks []string `yaml:"stacks"`
 }
 
-// App is a deployable unit placed on nodes that hold one of its roles.
-type App struct {
+// Stack is the env-independent definition of a set of compose projects, stored
+// at stacks/<name>/stack.yml.
+type Stack struct {
+	Name     string    `yaml:"name"`
+	Projects []Project `yaml:"projects"`
+}
+
+// Project is one Docker Compose project within a stack. It switches Blue/Green
+// color as a whole (or is recreated in place, for projects that cannot run two
+// colors at once, e.g. a database).
+type Project struct {
 	Name string `yaml:"name"`
-	// Roles: the app runs on a node if the node holds at least one of these
-	// roles in the environment. An empty list matches every node in the env.
-	Roles []string `yaml:"roles"`
-	// Compose is the compose file path, relative to the environment directory.
+	// Compose is the compose file path, relative to the stack directory.
 	Compose string `yaml:"compose"`
-	// Strategy is the deploy strategy. Phase 1 supports "recreate".
+	// Strategy is "blue-green" (default) or "recreate".
 	Strategy string `yaml:"strategy"`
 }
 
-// DesiredApp is the desired image and tag for an app, from
-// environments/<env>/deployment-state.yml.
-type DesiredApp struct {
+// BlueGreen reports whether the project uses the Blue/Green strategy. Any value
+// other than "recreate" (including the empty default) means Blue/Green.
+func (p Project) BlueGreen() bool {
+	return !strings.EqualFold(strings.TrimSpace(p.Strategy), StrategyRecreate)
+}
+
+// ServiceImage is the desired image and tag for a single service.
+type ServiceImage struct {
 	Image string `yaml:"image"`
 	Tag   string `yaml:"tag"`
 }
 
 // Ref returns the fully qualified image reference (image:tag).
-func (d DesiredApp) Ref() string {
-	return d.Image + ":" + d.Tag
+func (s ServiceImage) Ref() string {
+	return s.Image + ":" + s.Tag
 }
+
+// StackState is the desired state for one stack in one environment, stored at
+// environments/<env>/state/<stack>.yml. It maps project name -> service name ->
+// desired image/tag.
+type StackState map[string]map[string]ServiceImage
 
 // LoadInventory reads inventory/nodes.yml from the checked-out repo root.
 func LoadInventory(repoRoot string) (Inventory, error) {
@@ -159,30 +176,62 @@ func LoadInventory(repoRoot string) (Inventory, error) {
 	return inv, nil
 }
 
-// LoadPlacement reads environments/<env>/placement.yml.
-func LoadPlacement(repoRoot, env string) (Placement, error) {
-	var p Placement
-	if err := loadYAML(filepath.Join(repoRoot, "environments", env, "placement.yml"), &p); err != nil {
-		return Placement{}, err
+// LoadEnvironment reads environments/<env>/env.yml.
+func LoadEnvironment(repoRoot, env string) (Environment, error) {
+	var e Environment
+	if err := loadYAML(filepath.Join(repoRoot, "environments", env, "env.yml"), &e); err != nil {
+		return Environment{}, err
 	}
-	return p, nil
+	if e.Name == "" {
+		e.Name = env
+	}
+	return e, nil
 }
 
-// LoadDesiredState reads environments/<env>/deployment-state.yml as a map of
-// app name to desired image/tag. Unknown top-level keys (e.g. a future
-// metadata block) are ignored.
-func LoadDesiredState(repoRoot, env string) (map[string]DesiredApp, error) {
-	path := filepath.Join(repoRoot, "environments", env, "deployment-state.yml")
-	var state map[string]DesiredApp
-	if err := loadYAML(path, &state); err != nil {
-		return nil, err
-	}
-	return state, nil
+// StackDir returns the absolute path to a stack's definition directory.
+func StackDir(repoRoot, stack string) string {
+	return filepath.Join(repoRoot, "stacks", stack)
 }
 
-// EnvDir returns the absolute path to an environment directory.
-func EnvDir(repoRoot, env string) string {
-	return filepath.Join(repoRoot, "environments", env)
+// LoadStack reads stacks/<stack>/stack.yml.
+func LoadStack(repoRoot, stack string) (Stack, error) {
+	var s Stack
+	if err := loadYAML(filepath.Join(StackDir(repoRoot, stack), "stack.yml"), &s); err != nil {
+		return Stack{}, err
+	}
+	if s.Name == "" {
+		s.Name = stack
+	}
+	for i := range s.Projects {
+		if s.Projects[i].Strategy == "" {
+			s.Projects[i].Strategy = StrategyBlueGreen
+		}
+	}
+	return s, nil
+}
+
+// ComposeFile returns the absolute path to a project's compose file.
+func ComposeFile(repoRoot, stack string, p Project) string {
+	return filepath.Join(StackDir(repoRoot, stack), p.Compose)
+}
+
+// LoadStackState reads environments/<env>/state/<stack>.yml as the desired
+// state for the stack. A missing file yields an empty state (no desired images
+// yet), not an error.
+func LoadStackState(repoRoot, env, stack string) (StackState, error) {
+	path := filepath.Join(repoRoot, "environments", env, "state", stack+".yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return StackState{}, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var st StackState
+	if err := yaml.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return st, nil
 }
 
 func loadYAML(path string, out any) error {

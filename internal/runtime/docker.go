@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// Colors are the two Blue/Green deployment slots. A reconcile always deploys
-// the new version into the slot the app is not currently running in, then
-// stops the old slot once the new one is healthy.
+// Colors are the two Blue/Green deployment slots. A Blue/Green reconcile always
+// deploys the new version into the slot the project is not currently running
+// in, then stops the old slot once the new one is healthy.
 const (
 	ColorBlue  = "blue"
 	ColorGreen = "green"
@@ -30,94 +30,65 @@ func OtherColor(color string) string {
 	return ColorBlue
 }
 
-// ProjectName builds a Docker Compose project name for one Blue/Green slot. It
-// includes the node name so that multiple simulated nodes can run on a single
-// host during local testing without colliding. On a real one-node-per-host
-// setup the node name is simply a stable prefix.
-func ProjectName(node, env, app, color string) string {
-	return sanitize(fmt.Sprintf("kompensator-%s-%s-%s-%s", node, env, app, color))
-}
-
-// ColorState is a running Blue/Green slot and the image it serves.
-type ColorState struct {
-	Color string
-	Image string
-}
-
-// RunningColors reports which Blue/Green slots currently have a running
-// container for the app's service, together with the image each one serves.
-// The result has at most two entries (blue, green) and is empty when nothing
-// is running. dockerHost is the docker "-H" endpoint to query ("" = local
-// daemon); a controller passes a node's ssh:// endpoint here.
-func RunningColors(ctx context.Context, dockerHost, node, env, app, service string) ([]ColorState, error) {
-	var states []ColorState
-	for _, color := range Colors {
-		project := ProjectName(node, env, app, color)
-		image, err := RunningImage(ctx, dockerHost, project, service)
-		if err != nil {
-			return nil, err
-		}
-		if image != "" {
-			states = append(states, ColorState{Color: color, Image: image})
-		}
+// ProjectName builds a Docker Compose project name for one project of a stack.
+// It includes the node name so that multiple simulated nodes can run on a
+// single host during local testing without colliding. For Blue/Green projects
+// the color is appended; recreate projects pass an empty color and get no
+// suffix.
+func ProjectName(node, env, stack, project, color string) string {
+	base := fmt.Sprintf("kompensator-%s-%s-%s-%s", node, env, stack, project)
+	if color != "" {
+		base += "-" + color
 	}
-	return states, nil
+	return sanitize(base)
 }
 
-// RunningImage returns the image reference of the running container for the
-// given compose project/service, or "" if none is running. dockerHost is the
-// docker "-H" endpoint to query ("" = local daemon).
-func RunningImage(ctx context.Context, dockerHost, project, service string) (string, error) {
+// Container is one running (or stopped) container of a project's service.
+type Container struct {
+	Color   string // "blue" / "green" / "" (recreate); set by the caller
+	Service string // compose service name, e.g. "frontend"
+	Name    string // short name, e.g. "frontend-1" (service + replica number)
+	Image   string // image reference it runs
+	Health  string // concise health: healthy/starting/unhealthy/running/exited
+}
+
+// ProjectImages reports the running image per service for a compose project, or
+// an empty map when nothing runs. dockerHost is the docker "-H" endpoint to
+// query ("" = local daemon); a controller passes a node's ssh:// endpoint.
+func ProjectImages(ctx context.Context, dockerHost, project string) (map[string]string, error) {
 	out, err := output(ctx, "docker", dockerArgs(dockerHost,
 		"ps",
 		"--filter", "label=com.docker.compose.project="+project,
-		"--filter", "label=com.docker.compose.service="+service,
-		"--format", "{{.Image}}",
+		"--format", `{{.Label "com.docker.compose.service"}}`+"\t{{.Image}}",
 	)...)
 	if err != nil {
-		return "", fmt.Errorf("docker ps: %w: %s", err, out)
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
 	}
-	return firstLine(out), nil
-}
-
-// Container is one running (or stopped) container of an app's service, in a
-// particular Blue/Green slot.
-type Container struct {
-	Color  string // "blue" / "green"
-	Name   string // short name, e.g. "web-2" (service + replica number)
-	Image  string // image reference it runs
-	Health string // concise health: healthy/starting/unhealthy/running/exited
-}
-
-// RunningContainers lists every container of the app's service across both
-// Blue/Green slots, one entry per replica. dockerHost is the docker "-H"
-// endpoint to query ("" = local daemon).
-func RunningContainers(ctx context.Context, dockerHost, node, env, app, service string) ([]Container, error) {
-	var all []Container
-	for _, color := range Colors {
-		project := ProjectName(node, env, app, color)
-		cs, err := containersFor(ctx, dockerHost, project, service)
-		if err != nil {
-			return nil, err
+	images := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
 		}
-		for _, c := range cs {
-			c.Color = color
-			all = append(all, c)
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
 		}
+		images[parts[0]] = parts[1]
 	}
-	return all, nil
+	return images, nil
 }
 
-// containersFor lists the containers of one compose project/service. The short
-// name is "<service>-<replica-number>" so it stays readable next to the
-// node/env/app/color columns that already encode the project.
-func containersFor(ctx context.Context, dockerHost, project, service string) ([]Container, error) {
-	const fmtStr = `{{.Label "com.docker.compose.service"}}-{{.Label "com.docker.compose.container-number"}}` +
+// ProjectContainers lists every container of a compose project (running or
+// stopped), one entry per replica, sorted by name. The short name is
+// "<service>-<replica-number>". dockerHost is the docker "-H" endpoint ("" =
+// local daemon). Color is left empty for the caller to fill in.
+func ProjectContainers(ctx context.Context, dockerHost, project string) ([]Container, error) {
+	const fmtStr = `{{.Label "com.docker.compose.service"}}` + "\t" +
+		`{{.Label "com.docker.compose.service"}}-{{.Label "com.docker.compose.container-number"}}` +
 		"\t{{.Image}}\t{{.Status}}"
 	out, err := output(ctx, "docker", dockerArgs(dockerHost,
 		"ps", "-a",
 		"--filter", "label=com.docker.compose.project="+project,
-		"--filter", "label=com.docker.compose.service="+service,
 		"--format", fmtStr,
 	)...)
 	if err != nil {
@@ -129,11 +100,16 @@ func containersFor(ctx context.Context, dockerHost, project, service string) ([]
 		if line = strings.TrimSpace(line); line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) != 3 {
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) != 4 {
 			continue
 		}
-		cs = append(cs, Container{Name: parts[0], Image: parts[1], Health: shortHealth(parts[2])})
+		cs = append(cs, Container{
+			Service: parts[0],
+			Name:    parts[1],
+			Image:   parts[2],
+			Health:  shortHealth(parts[3]),
+		})
 	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
 	return cs, nil
@@ -162,24 +138,22 @@ func shortHealth(status string) string {
 	}
 }
 
-// Deploy brings one Blue/Green slot up to the desired image/tag using Docker
-// Compose. The compose file is expected to reference ${IMAGE} and ${TAG}, and
-// may use ${NODE_NAME}.
+// Deploy brings a compose project up to its desired state using Docker Compose.
+// The compose file references per-service variables (e.g. ${FRONTEND_IMAGE},
+// ${FRONTEND_TAG}) and may use ${NODE_NAME}; extraEnv carries those values as
+// "KEY=value" entries.
 //
 // Images are pulled by compose only when missing. The GitOps model uses
 // immutable tags (new version = new tag), so a missing-pull is sufficient and
 // also lets locally-built images work without a registry.
-func Deploy(ctx context.Context, composeFile, project, node, image, tag string) error {
+func Deploy(ctx context.Context, composeFile, project, node string, extraEnv []string) error {
 	cmd := exec.CommandContext(ctx, "docker", "compose",
 		"-p", project,
 		"-f", composeFile,
 		"up", "-d", "--remove-orphans",
 	)
-	cmd.Env = append(os.Environ(),
-		"IMAGE="+image,
-		"TAG="+tag,
-		"NODE_NAME="+node,
-	)
+	cmd.Env = append(os.Environ(), "NODE_NAME="+node)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -188,7 +162,7 @@ func Deploy(ctx context.Context, composeFile, project, node, image, tag string) 
 	return nil
 }
 
-// Stop tears down a Blue/Green slot (the old color after a successful switch).
+// Stop tears down a compose project (the old color after a successful switch).
 func Stop(ctx context.Context, project string) error {
 	out, err := output(ctx, "docker", "compose", "-p", project, "down")
 	if err != nil {
