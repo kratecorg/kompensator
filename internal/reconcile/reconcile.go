@@ -2,6 +2,8 @@ package reconcile
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -308,6 +310,51 @@ func loadSecretVars(home, repoRoot, env, stack string) (map[string]string, error
 	return secrets.DecryptMap(secrets.KeyPath(home), data)
 }
 
+// computeConfigHash fingerprints everything that influences a deploy but is not
+// captured by the image tags: the compose file content and the effective deploy
+// environment (sorted KEY=value entries: variables, secrets and image refs).
+// Two deploys with the same fingerprint are equivalent. The secret values feed
+// the one-way hash only, so the fingerprint never leaks them.
+func computeConfigHash(composeFile string, extraEnv []string) (string, error) {
+	data, err := os.ReadFile(composeFile)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write(data)
+	h.Write([]byte{0})
+	for _, e := range extraEnv {
+		h.Write([]byte(e))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// deployStateDir is where the per-project config fingerprints live on a node.
+func deployStateDir(home string) string {
+	return filepath.Join(home, "deploy-state")
+}
+
+// readDeployHash returns the last deployed config fingerprint for a project, or
+// "" when none was recorded yet (treated as drift so the next reconcile
+// re-establishes the baseline).
+func readDeployHash(home, project string) string {
+	data, err := os.ReadFile(filepath.Join(deployStateDir(home), project))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// writeDeployHash records the config fingerprint of the deploy just performed.
+func writeDeployHash(home, project, hash string) error {
+	dir := deployStateDir(home)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, project), []byte(hash+"\n"), 0o644)
+}
+
 // reconcileProject brings one compose project to its desired state, using its
 // Blue/Green or recreate strategy.
 func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, vars map[string]string, desired map[string]repo.ServiceImage, res *Result) error {
@@ -329,30 +376,43 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	extraEnv, desiredRefs := buildEnv(opts.Env, vars, desired)
 	composeFile := repo.ComposeFile(repoRoot, stack, p)
 
-	if p.BlueGreen() {
-		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
+	// The config hash folds the compose file and the effective deploy env
+	// (variables, secrets and image refs) into one fingerprint. It lets a
+	// reconcile detect changes that leave the image tags untouched — a changed
+	// variable, secret or compose file — which image comparison alone misses.
+	configHash, err := computeConfigHash(composeFile, extraEnv)
+	if err != nil {
+		return fmt.Errorf("config hash: %w", err)
 	}
-	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, res)
+
+	if p.BlueGreen() {
+		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, res)
+	}
+	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, res)
 }
 
 // recreateProject deploys a project in place (no color). Used for projects that
 // cannot run two colors at once, e.g. a database.
-func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
+func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, res *Result) error {
 	proj := names.Project(opts.Env, stack, project, "")
 
 	running, err := runtime.ProjectImages(ctx, "", proj)
 	if err != nil {
 		return err
 	}
-	if imagesMatch(running, desiredRefs) && !opts.Force {
+	imagesInSync := imagesMatch(running, desiredRefs)
+	if imagesInSync && readDeployHash(opts.Home, proj) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs))
 		res.InSync++
 		return nil
 	}
 
 	reason := "drift detected, recreating project"
-	if opts.Force {
+	switch {
+	case opts.Force:
 		reason = "force redeploy (recreate)"
+	case imagesInSync:
+		reason = "config changed, recreating project"
 	}
 	log.Info(reason, "running", describeImages(running), "desired", describeRefs(desiredRefs))
 
@@ -369,6 +429,9 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	if !imagesMatch(got, desiredRefs) {
 		return fmt.Errorf("after deploy, running images %s != desired %s", describeImages(got), describeRefs(desiredRefs))
 	}
+	if err := writeDeployHash(opts.Home, proj, configHash); err != nil {
+		return err
+	}
 
 	log.Info("deployed", "images", describeRefs(desiredRefs))
 	res.Deployed++
@@ -377,15 +440,21 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 
 // blueGreenProject deploys a project into the idle color, waits for it to
 // become healthy, verifies its images, then stops the previously active color.
-func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, res *Result) error {
+func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, res *Result) error {
 	running, err := runningByColor(ctx, "", names, opts.Env, stack, project)
 	if err != nil {
 		return err
 	}
 
-	// A color that fully serves the desired images means we are in sync; stop
-	// any stale other color left behind by a prior switch. --force overrides.
-	if active := colorServing(running, desiredRefs); active != "" && !opts.Force {
+	// The hash is tracked per project, independent of the active color, so a
+	// config change forces a switch to the idle color just like an image change.
+	hashKey := names.Project(opts.Env, stack, project, "")
+
+	// A color that fully serves the desired images AND matches the deployed
+	// config means we are in sync; stop any stale other color left behind by a
+	// prior switch. --force overrides.
+	active := colorServing(running, desiredRefs)
+	if active != "" && readDeployHash(opts.Home, hashKey) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs), "color", active)
 		if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, active, running); err != nil {
 			return err
@@ -398,8 +467,11 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	targetProject := names.Project(opts.Env, stack, project, target)
 
 	reason := "drift detected, deploying to idle color"
-	if opts.Force {
+	switch {
+	case opts.Force:
 		reason = "force redeploy to idle color"
+	case active != "":
+		reason = "config changed, deploying to idle color"
 	}
 	log.Info(reason, "running", describeColors(running), "desired", describeRefs(desiredRefs), "target_color", target)
 
@@ -421,6 +493,9 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	log.Info("new color healthy", "color", target, "images", describeRefs(desiredRefs))
 
 	if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, target, running); err != nil {
+		return err
+	}
+	if err := writeDeployHash(opts.Home, hashKey, configHash); err != nil {
 		return err
 	}
 
