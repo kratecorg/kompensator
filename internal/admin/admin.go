@@ -432,10 +432,6 @@ func SecretsRekey(ctx context.Context, home, repoName, env string, log *slog.Log
 // recipient set and pushes the change. It is a no-op (no commit) when the
 // environment has no secrets. Shared by SecretsRekey and NodeSetEnv.
 func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, env string) error {
-	recipients, err := envRecipients(home, dest, env)
-	if err != nil {
-		return err
-	}
 	dir := filepath.Join(dest, "environments", env, "secrets")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -450,6 +446,11 @@ func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, 
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yml.age") {
 			continue
+		}
+		stack := strings.TrimSuffix(e.Name(), ".yml.age")
+		recipients, err := stackRecipients(home, dest, env, stack)
+		if err != nil {
+			return err
 		}
 		full := filepath.Join(dir, e.Name())
 		data, err := os.ReadFile(full)
@@ -473,18 +474,18 @@ func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, 
 		log.Info("no secrets to rekey", "env", env)
 		return nil
 	}
-	msg := fmt.Sprintf("secrets: rekey %s for %d recipient(s)", env, len(recipients))
+	msg := fmt.Sprintf("secrets: rekey %s", env)
 	if err := gitsync.CommitPush(ctx, dest, r.Branch, msg, changed...); err != nil {
 		return err
 	}
-	log.Info("secrets rekeyed", "env", env, "files", len(changed), "recipients", len(recipients))
+	log.Info("secrets rekeyed", "env", env, "files", len(changed))
 	return nil
 }
 
 // writeSecrets encrypts values for the env's recipients and writes + pushes the
 // secrets file. Shared by SecretsSet and SecretsEdit.
 func writeSecrets(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, env, stack string, values map[string]string) error {
-	recipients, err := envRecipients(home, dest, env)
+	recipients, err := stackRecipients(home, dest, env, stack)
 	if err != nil {
 		return err
 	}
@@ -508,11 +509,14 @@ func writeSecrets(ctx context.Context, log *slog.Logger, r config.Repo, dest, ho
 	return nil
 }
 
-// envRecipients returns the age recipients an environment's secrets are
-// encrypted for: the controller's own identity (so it can keep editing) plus
-// every participating node's recipient. The controller identity is created on
-// first use.
-func envRecipients(home, dest, env string) ([]string, error) {
+// stackRecipients returns the age recipients a stack's secrets are encrypted
+// for: the controller's own identity (so it can keep editing) plus the nodes
+// that actually run the stack. An unpinned stack uses every node in the
+// environment; a stack (or its projects) pinned to a node subset uses only
+// those nodes, so a pinned stack's secret (e.g. a database password) is
+// decryptable solely by the node(s) that run it. The controller identity is
+// created on first use.
+func stackRecipients(home, dest, env, stack string) ([]string, error) {
 	controllerRecipient, created, err := secrets.LoadOrCreateIdentity(home)
 	if err != nil {
 		return nil, err
@@ -524,7 +528,20 @@ func envRecipients(home, dest, env string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	recipients := append([]string{controllerRecipient}, inv.RecipientsForEnv(env)...)
+	e, err := repo.LoadEnvironment(dest, env)
+	if err != nil {
+		return nil, err
+	}
+	// Project names let NodesRunningStack honor project-level pins; if the stack
+	// definition is unavailable, fall back to stack-level placement only.
+	var projectNames []string
+	if s, err := repo.LoadStack(dest, stack); err == nil {
+		for _, p := range s.Projects {
+			projectNames = append(projectNames, p.Name)
+		}
+	}
+	runningNodes := e.NodesRunningStack(stack, projectNames, inv.NodesForEnv(env))
+	recipients := append([]string{controllerRecipient}, inv.RecipientsForNodes(runningNodes)...)
 	return dedupeStrings(recipients), nil
 }
 

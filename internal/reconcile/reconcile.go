@@ -266,7 +266,12 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		return res, nil
 	}
 
-	for _, stackName := range env.Stacks {
+	for _, placement := range env.Stacks {
+		stackName := placement.Name
+		if !placement.StackRunsOn(names.Node) {
+			log.Info("stack not placed on this node, skipping", "stack", stackName, "node", names.Node)
+			continue
+		}
 		stack, err := repo.LoadStack(repoRoot, stackName)
 		if err != nil {
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
@@ -284,6 +289,10 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 			vars[k] = v
 		}
 		for _, p := range stack.Projects {
+			if !placement.ProjectRunsOn(p.Name, names.Node) {
+				log.Info("project not placed on this node, skipping", "stack", stackName, "project", p.Name, "node", names.Node)
+				continue
+			}
 			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, vars, state[p.Name], &res); err != nil {
 				log.Error("project reconcile failed", "stack", stackName, "project", p.Name, "error", err)
 				res.Failed++
@@ -753,7 +762,11 @@ func statusEnv(ctx context.Context, repoRoot string, names runtime.Names, t stat
 	}
 
 	var out []ServiceStatus
-	for _, stackName := range e.Stacks {
+	for _, placement := range e.Stacks {
+		if !placement.StackRunsOn(t.node) {
+			continue // stack pinned away from this node
+		}
+		stackName := placement.Name
 		stack, err := repo.LoadStack(repoRoot, stackName)
 		if err != nil {
 			return nil, fmt.Errorf("repo %q stack %q: %w", names.Repo, stackName, err)
@@ -763,6 +776,9 @@ func statusEnv(ctx context.Context, repoRoot string, names runtime.Names, t stat
 			return nil, fmt.Errorf("repo %q stack %q: %w", names.Repo, stackName, err)
 		}
 		for _, p := range stack.Projects {
+			if !placement.ProjectRunsOn(p.Name, t.node) {
+				continue // project pinned away from this node
+			}
 			rows, err := statusProject(ctx, t, names, env, stackName, p, state[p.Name])
 			if err != nil {
 				return nil, err

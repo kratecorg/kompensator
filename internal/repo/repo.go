@@ -146,23 +146,37 @@ func (inv Inventory) EnvsForNode(node string) []string {
 	return nil
 }
 
-// RecipientsForEnv returns the age recipients of every node that participates
-// in the environment and has a recipient set. Used to encrypt the
-// environment's secrets so each participating node can decrypt them.
-func (inv Inventory) RecipientsForEnv(env string) []string {
+// RecipientsForNodes returns the age recipients of the named nodes that have a
+// recipient set, in inventory order. Used to scope a pinned stack's secrets to
+// exactly the nodes that run it.
+func (inv Inventory) RecipientsForNodes(names []string) []string {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
 	var recipients []string
 	for _, n := range inv.Nodes {
-		if n.AgeRecipient == "" {
+		if n.AgeRecipient == "" || !want[n.Name] {
 			continue
 		}
+		recipients = append(recipients, n.AgeRecipient)
+	}
+	return recipients
+}
+
+// NodesForEnv returns the names of every node that participates in the
+// environment, in inventory order.
+func (inv Inventory) NodesForEnv(env string) []string {
+	var names []string
+	for _, n := range inv.Nodes {
 		for _, e := range n.Environments {
 			if e == env {
-				recipients = append(recipients, n.AgeRecipient)
+				names = append(names, n.Name)
 				break
 			}
 		}
 	}
-	return recipients
+	return names
 }
 
 // index returns the position of the named node, or -1 if absent.
@@ -237,14 +251,174 @@ func (inv *Inventory) LeaveEnv(name, env string) error {
 // Environment is a deployment target, stored at environments/<env>/env.yml. It
 // lists which stacks are deployed in this environment.
 type Environment struct {
-	Name   string   `yaml:"name"`
-	Stacks []string `yaml:"stacks"`
+	Name   string           `yaml:"name"`
+	Stacks []StackPlacement `yaml:"stacks"`
 	// Variables are environment-specific values injected into every compose
 	// project of this environment. They override a stack's own defaults and let
 	// e.g. dev and prod use different settings (replica counts, feature flags).
 	// The kompensator built-ins (NODE_NAME, ENV_NAME, <SERVICE>_IMAGE/_TAG)
 	// always win and cannot be shadowed here.
 	Variables map[string]string `yaml:"variables"`
+}
+
+// StackPlacement is one stack listed in an environment, optionally pinned to a
+// subset of the environment's nodes at the stack and/or project level. In
+// env.yml a stack may be written either as a bare name (it then runs on every
+// node that participates in the environment) or as a mapping:
+//
+//	stacks:
+//	  - kratec                # runs on all nodes in the env (the default)
+//	  - name: myref
+//	    nodes: customer03     # whole stack pinned to one node
+//	  - name: carimco         # stack runs everywhere...
+//	    projects:
+//	      - name: app
+//	        nodes: [customer03] # ...but its app project only on customer03
+//
+// nodes accepts either a single name or a list. Placement only narrows within
+// the environment's node pool (the inventory still decides which nodes
+// participate at all and how to reach them); it never adds a node that is not a
+// member of the environment. A project-level pin narrows further within the
+// stack-level pin.
+type StackPlacement struct {
+	Name string `yaml:"name"`
+	// Nodes pins the whole stack to these node names. Empty means "every node in
+	// the environment" (no stack-level pin).
+	Nodes NodeList `yaml:"nodes,omitempty"`
+	// Projects pins individual projects of the stack to a node subset. A project
+	// not listed here inherits the stack-level placement.
+	Projects []ProjectPlacement `yaml:"projects,omitempty"`
+}
+
+// ProjectPlacement pins one project of a stack to a subset of nodes within the
+// stack's own placement.
+type ProjectPlacement struct {
+	Name string `yaml:"name"`
+	// Nodes pins the project to these node names. Empty means "wherever the
+	// stack runs" (no project-level pin).
+	Nodes NodeList `yaml:"nodes,omitempty"`
+}
+
+// NodeList is a list of node names that decodes from either a single scalar
+// ("customer03") or a YAML sequence (["customer03", "customer04"]).
+type NodeList []string
+
+// UnmarshalYAML accepts a scalar or a sequence for a node pin.
+func (nl *NodeList) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		var s string
+		if err := value.Decode(&s); err != nil {
+			return err
+		}
+		if s != "" {
+			*nl = NodeList{s}
+		}
+		return nil
+	}
+	var s []string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+	*nl = NodeList(s)
+	return nil
+}
+
+// has reports whether the list contains the node (an empty list means "no pin"
+// and is handled by the callers, not here).
+func (nl NodeList) has(node string) bool {
+	for _, n := range nl {
+		if n == node {
+			return true
+		}
+	}
+	return false
+}
+
+// UnmarshalYAML accepts either a bare stack name (scalar) or a mapping with an
+// explicit pin, so both forms in env.yml decode into a StackPlacement.
+func (s *StackPlacement) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&s.Name)
+	}
+	type raw StackPlacement
+	var r raw
+	if err := value.Decode(&r); err != nil {
+		return err
+	}
+	*s = StackPlacement(r)
+	return nil
+}
+
+// StackRunsOn reports whether the stack should run on the named node according
+// to its stack-level pin. An unpinned stack runs on every node in the
+// environment. Project-level pins are checked separately (ProjectRunsOn).
+func (s StackPlacement) StackRunsOn(node string) bool {
+	return len(s.Nodes) == 0 || s.Nodes.has(node)
+}
+
+// ProjectRunsOn reports whether the named project should run on the node. It
+// combines the stack-level pin with any project-level pin: the stack must run
+// on the node, and if the project carries its own pin the node must also be in
+// it.
+func (s StackPlacement) ProjectRunsOn(project, node string) bool {
+	if !s.StackRunsOn(node) {
+		return false
+	}
+	for _, p := range s.Projects {
+		if p.Name == project {
+			return len(p.Nodes) == 0 || p.Nodes.has(node)
+		}
+	}
+	return true
+}
+
+// StackNames returns the names of every stack placed in the environment, in
+// order, regardless of pinning.
+func (e Environment) StackNames() []string {
+	names := make([]string, len(e.Stacks))
+	for i, s := range e.Stacks {
+		names[i] = s.Name
+	}
+	return names
+}
+
+// placement returns the StackPlacement for a stack and whether it is listed in
+// the environment.
+func (e Environment) placement(stack string) (StackPlacement, bool) {
+	for _, s := range e.Stacks {
+		if s.Name == stack {
+			return s, true
+		}
+	}
+	return StackPlacement{}, false
+}
+
+// NodesRunningStack returns the subset of envNodes that run at least one of the
+// stack's projects, honoring both stack- and project-level pins. It is used to
+// scope a stack's secrets to exactly the nodes that run it. When projects is
+// empty (project list unknown) it falls back to the stack-level placement.
+func (e Environment) NodesRunningStack(stack string, projects, envNodes []string) []string {
+	p, ok := e.placement(stack)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, node := range envNodes {
+		if !p.StackRunsOn(node) {
+			continue
+		}
+		if len(projects) == 0 {
+			out = append(out, node)
+			continue
+		}
+		for _, proj := range projects {
+			if p.ProjectRunsOn(proj, node) {
+				out = append(out, node)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // Stack is the env-independent definition of a set of compose projects, stored
