@@ -16,6 +16,7 @@ import (
 	"kompensator/internal/gitsync"
 	"kompensator/internal/repo"
 	"kompensator/internal/runtime"
+	"kompensator/internal/secrets"
 )
 
 // healthTimeout bounds how long a deploy waits for new containers to become
@@ -272,8 +273,16 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		if err != nil {
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
 		}
+		vars := repo.MergeVariables(stack.Variables, env.Variables)
+		secretVars, err := loadSecretVars(opts.Home, repoRoot, opts.Env, stackName)
+		if err != nil {
+			return res, fmt.Errorf("stack %q secrets: %w", stackName, err)
+		}
+		for k, v := range secretVars {
+			vars[k] = v
+		}
 		for _, p := range stack.Projects {
-			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, state[p.Name], &res); err != nil {
+			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, vars, state[p.Name], &res); err != nil {
 				log.Error("project reconcile failed", "stack", stackName, "project", p.Name, "error", err)
 				res.Failed++
 			}
@@ -282,9 +291,26 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 	return res, nil
 }
 
+// loadSecretVars decrypts the stack's secrets file for the environment, if one
+// exists, using the node's own age identity. It returns nil when no secrets
+// file is present. A present file with no usable identity (e.g. the node was
+// provisioned before secrets support, or is not a recipient) is an error so a
+// missing secret never silently degrades a deploy.
+func loadSecretVars(home, repoRoot, env, stack string) (map[string]string, error) {
+	path := repo.SecretsFile(repoRoot, env, stack)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return secrets.DecryptMap(secrets.KeyPath(home), data)
+}
+
 // reconcileProject brings one compose project to its desired state, using its
 // Blue/Green or recreate strategy.
-func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, desired map[string]repo.ServiceImage, res *Result) error {
+func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, vars map[string]string, desired map[string]repo.ServiceImage, res *Result) error {
 	plog := log.With("stack", stack, "project", p.Name, "strategy", p.Strategy)
 
 	if len(desired) == 0 {
@@ -300,7 +326,7 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 		}
 	}
 
-	extraEnv, desiredRefs := buildEnv(desired)
+	extraEnv, desiredRefs := buildEnv(opts.Env, vars, desired)
 	composeFile := repo.ComposeFile(repoRoot, stack, p)
 
 	if p.BlueGreen() {
@@ -403,14 +429,29 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	return nil
 }
 
-// buildEnv turns a service->desired-image map into compose env vars
-// (<SERVICE>_IMAGE / <SERVICE>_TAG) and the desired image refs per service.
-func buildEnv(desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
+// buildEnv assembles the compose env vars for a deploy: the stack/env variables
+// (lowest precedence), the built-in ENV_NAME, and the per-service
+// <SERVICE>_IMAGE / <SERVICE>_TAG values (highest precedence, so user variables
+// can never break image injection). NODE_NAME is added separately by Deploy. It
+// also returns the desired image ref per service.
+func buildEnv(envName string, vars map[string]string, desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
+	merged := make(map[string]string, len(vars)+len(desired)*2+1)
+	for k, v := range vars {
+		merged[k] = v
+	}
+	merged["ENV_NAME"] = envName
+
 	refs = make(map[string]string, len(desired))
 	for svc, si := range desired {
 		v := envVarName(svc)
-		extraEnv = append(extraEnv, v+"_IMAGE="+si.Image, v+"_TAG="+si.Tag)
+		merged[v+"_IMAGE"] = si.Image
+		merged[v+"_TAG"] = si.Tag
 		refs[svc] = si.Ref()
+	}
+
+	extraEnv = make([]string, 0, len(merged))
+	for k, v := range merged {
+		extraEnv = append(extraEnv, k+"="+v)
 	}
 	sort.Strings(extraEnv)
 	return extraEnv, refs

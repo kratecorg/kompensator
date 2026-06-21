@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -50,6 +51,8 @@ func main() {
 		os.Exit(cmdStatus(g, rest))
 	case "node":
 		os.Exit(cmdNode(g, rest))
+	case "secrets":
+		os.Exit(cmdSecrets(g, rest))
 	case "version":
 		fmt.Println("kompensator", version)
 	case "help":
@@ -319,6 +322,166 @@ func dash(s string) string {
 	return s
 }
 
+func cmdSecrets(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets <set|show|edit|rekey> ...")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "set":
+		return cmdSecretsSet(g, rest)
+	case "show":
+		return cmdSecretsShow(g, rest)
+	case "edit":
+		return cmdSecretsEdit(g, rest)
+	case "rekey":
+		return cmdSecretsRekey(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown secrets subcommand: %s\n", sub)
+		return 2
+	}
+}
+
+func cmdSecretsSet(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets set", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets set <env> <stack> [--repo <name>]")
+		fmt.Fprintln(os.Stderr, "  Reads a flat YAML map of KEY: value from stdin.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack := arg(pos, 0), arg(pos, 1)
+	if env == "" || stack == "" {
+		fs.Usage()
+		return 2
+	}
+	plaintext, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: read stdin:", err)
+		return 1
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.SecretsSet(ctx, h, *repoName, env, stack, plaintext, log); err != nil {
+		log.Error("secrets set failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdSecretsShow(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets show", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets show <env> <stack> [--repo <name>]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack := arg(pos, 0), arg(pos, 1)
+	if env == "" || stack == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	plaintext, err := admin.SecretsShow(ctx, h, *repoName, env, stack)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	os.Stdout.Write(plaintext)
+	return 0
+}
+
+func cmdSecretsEdit(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets edit", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets edit <env> <stack> [--repo <name>]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack := arg(pos, 0), arg(pos, 1)
+	if env == "" || stack == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.SecretsEdit(ctx, h, *repoName, env, stack, log); err != nil {
+		log.Error("secrets edit failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdSecretsRekey(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets rekey", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets rekey <env> [--repo <name>]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env := arg(pos, 0)
+	if env == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.SecretsRekey(ctx, h, *repoName, env, log); err != nil {
+		log.Error("secrets rekey failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
 // parseFlagsAndArgs parses fs allowing flags and positional arguments to appear
 // in any order (the stdlib flag package stops parsing at the first positional).
 func parseFlagsAndArgs(fs *flag.FlagSet, args []string) ([]string, error) {
@@ -374,6 +537,12 @@ Commands:
   node leave <name> <env>   Detach a node from an environment
   node rm <name>    Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
+  secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
+                               secrets for an environment's stack
+  secrets show <env> <stack>   Decrypt and print an environment's stack secrets
+  secrets edit <env> <stack>   Edit an environment's stack secrets in $EDITOR
+  secrets rekey <env>          Re-encrypt an environment's secrets for the
+                               current recipient set (run after a node joins)
   version           Print version
   help              Show this help
 
@@ -385,5 +554,7 @@ Examples:
   kompensator -home /opt/controller node bootstrap --name node7 --location ssh://peter@host.example.org
   kompensator -home /opt/controller node add node7 dev
   kompensator -home /opt/controller node rm node7
+  echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
+  kompensator -home /opt/controller secrets rekey prod
 `)
 }

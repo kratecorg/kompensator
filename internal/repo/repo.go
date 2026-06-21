@@ -41,6 +41,11 @@ type Node struct {
 	Location string `yaml:"location"`
 	// Environments this node participates in.
 	Environments []string `yaml:"environments"`
+	// AgeRecipient is the node's public age key ("age1..."). The controller
+	// encrypts environment secrets for every node's recipient; the node
+	// decrypts them locally with its private key. Empty for nodes provisioned
+	// before secrets support.
+	AgeRecipient string `yaml:"ageRecipient,omitempty"`
 }
 
 // Location describes how a controller reaches a node.
@@ -141,6 +146,25 @@ func (inv Inventory) EnvsForNode(node string) []string {
 	return nil
 }
 
+// RecipientsForEnv returns the age recipients of every node that participates
+// in the environment and has a recipient set. Used to encrypt the
+// environment's secrets so each participating node can decrypt them.
+func (inv Inventory) RecipientsForEnv(env string) []string {
+	var recipients []string
+	for _, n := range inv.Nodes {
+		if n.AgeRecipient == "" {
+			continue
+		}
+		for _, e := range n.Environments {
+			if e == env {
+				recipients = append(recipients, n.AgeRecipient)
+				break
+			}
+		}
+	}
+	return recipients
+}
+
 // index returns the position of the named node, or -1 if absent.
 func (inv *Inventory) index(name string) int {
 	for i := range inv.Nodes {
@@ -157,13 +181,13 @@ func (inv *Inventory) Has(name string) bool {
 }
 
 // AddNode appends a node. It errors if a node of that name already exists.
-func (inv *Inventory) AddNode(name, location string, envs []string) error {
+func (inv *Inventory) AddNode(name, location, ageRecipient string, envs []string) error {
 	if inv.index(name) >= 0 {
 		return fmt.Errorf("node %q already in inventory", name)
 	}
 	sorted := append([]string(nil), envs...)
 	sort.Strings(sorted)
-	inv.Nodes = append(inv.Nodes, Node{Name: name, Location: location, Environments: sorted})
+	inv.Nodes = append(inv.Nodes, Node{Name: name, Location: location, Environments: sorted, AgeRecipient: ageRecipient})
 	return nil
 }
 
@@ -215,6 +239,12 @@ func (inv *Inventory) LeaveEnv(name, env string) error {
 type Environment struct {
 	Name   string   `yaml:"name"`
 	Stacks []string `yaml:"stacks"`
+	// Variables are environment-specific values injected into every compose
+	// project of this environment. They override a stack's own defaults and let
+	// e.g. dev and prod use different settings (replica counts, feature flags).
+	// The kompensator built-ins (NODE_NAME, ENV_NAME, <SERVICE>_IMAGE/_TAG)
+	// always win and cannot be shadowed here.
+	Variables map[string]string `yaml:"variables"`
 }
 
 // Stack is the env-independent definition of a set of compose projects, stored
@@ -222,6 +252,9 @@ type Environment struct {
 type Stack struct {
 	Name     string    `yaml:"name"`
 	Projects []Project `yaml:"projects"`
+	// Variables are the stack's own default values for the variables its compose
+	// files reference. An environment may override any of them.
+	Variables map[string]string `yaml:"variables"`
 }
 
 // Project is one Docker Compose project within a stack. It switches Blue/Green
@@ -239,6 +272,20 @@ type Project struct {
 // other than "recreate" (including the empty default) means Blue/Green.
 func (p Project) BlueGreen() bool {
 	return !strings.EqualFold(strings.TrimSpace(p.Strategy), StrategyRecreate)
+}
+
+// MergeVariables returns the effective variables for a stack in an environment:
+// the stack's own defaults overlaid with the environment's overrides. Neither
+// input is mutated; the result is always non-nil.
+func MergeVariables(stack, env map[string]string) map[string]string {
+	merged := make(map[string]string, len(stack)+len(env))
+	for k, v := range stack {
+		merged[k] = v
+	}
+	for k, v := range env {
+		merged[k] = v
+	}
+	return merged
 }
 
 // ServiceImage is the desired image and tag for a single service.
@@ -326,6 +373,12 @@ func LoadStack(repoRoot, stack string) (Stack, error) {
 // ComposeFile returns the absolute path to a project's compose file.
 func ComposeFile(repoRoot, stack string, p Project) string {
 	return filepath.Join(StackDir(repoRoot, stack), p.Compose)
+}
+
+// SecretsFile returns the absolute path to a stack's age-encrypted secrets file
+// for an environment: environments/<env>/secrets/<stack>.yml.age.
+func SecretsFile(repoRoot, env, stack string) string {
+	return filepath.Join(repoRoot, "environments", env, "secrets", stack+".yml.age")
 }
 
 // LoadStackState reads environments/<env>/state/<stack>.yml as the desired

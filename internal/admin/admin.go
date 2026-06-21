@@ -17,10 +17,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"kompensator/internal/config"
 	"kompensator/internal/gitsync"
 	"kompensator/internal/repo"
 	"kompensator/internal/runtime"
+	"kompensator/internal/secrets"
 )
 
 // defaultNodeHome is where a node's kompensator home is placed when an ssh
@@ -75,17 +78,24 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return err
 	}
 
+	// Each node gets its own age identity so the controller can encrypt
+	// environment secrets for it; the private key never leaves the node.
+	privateKey, recipient, err := secrets.GenerateIdentity()
+	if err != nil {
+		return err
+	}
+
 	if loc.Local {
-		err = provisionLocal(ctx, log, loc, self, cfgData, nodeCfg.Repos)
+		err = provisionLocal(ctx, log, loc, self, cfgData, privateKey, nodeCfg.Repos)
 	} else {
-		err = provisionRemote(ctx, log, loc, self, cfgData, nodeCfg.Repos)
+		err = provisionRemote(ctx, log, loc, self, cfgData, privateKey, nodeCfg.Repos)
 	}
 	if err != nil {
 		return err
 	}
 	log.Info("node provisioned", "node", opts.Name, "location", loc.String())
 
-	return registerNode(ctx, log, opts.ControllerHome, opts.InventoryRepo, opts.Name, loc.String(), opts.Envs)
+	return registerNode(ctx, log, opts.ControllerHome, opts.InventoryRepo, opts.Name, loc.String(), recipient, opts.Envs)
 }
 
 // resolveNodeLocation parses a provisioning location. For an ssh location with
@@ -110,7 +120,7 @@ func resolveNodeLocation(ctx context.Context, raw string) (repo.Location, error)
 }
 
 // provisionLocal provisions a node that shares the controller's filesystem.
-func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, repos []config.Repo) error {
+func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, repos []config.Repo) error {
 	if _, err := os.Stat(filepath.Join(loc.Path, "config.yml")); err == nil {
 		return fmt.Errorf("config already exists at %s (remove the node first)", loc.Path)
 	}
@@ -125,6 +135,10 @@ func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, bi
 		return fmt.Errorf("write node config: %w", err)
 	}
 	log.Info("wrote node config", "home", loc.Path)
+	if err := secrets.WriteIdentity(secrets.KeyPath(loc.Path), privateKey); err != nil {
+		return fmt.Errorf("write age identity: %w", err)
+	}
+	log.Info("wrote age identity", "home", loc.Path)
 	for _, r := range repos {
 		dest := filepath.Join(config.ReposDir(loc.Path), r.Name)
 		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
@@ -137,7 +151,7 @@ func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, bi
 }
 
 // provisionRemote provisions a node reachable over ssh.
-func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, repos []config.Repo) error {
+func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, repos []config.Repo) error {
 	reposDir := loc.Path + "/repos"
 	if err := remoteRun(ctx, loc, "test ! -e "+shellQuote(loc.Path+"/config.yml")); err != nil {
 		return fmt.Errorf("config already exists at %s:%s/config.yml (remove the node first)", loc.Host, loc.Path)
@@ -160,6 +174,15 @@ func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, b
 	}
 	log.Info("wrote node config", "home", loc.Host+":"+loc.Path)
 
+	keyPath := loc.Path + "/" + filepath.Base(secrets.KeyPath(loc.Path))
+	if err := remoteWriteFile(ctx, loc, keyPath, []byte(privateKey+"\n")); err != nil {
+		return fmt.Errorf("write age identity: %w", err)
+	}
+	if err := remoteRun(ctx, loc, "chmod 600 "+shellQuote(keyPath)); err != nil {
+		return fmt.Errorf("chmod age identity: %w", err)
+	}
+	log.Info("wrote age identity", "home", loc.Host+":"+loc.Path)
+
 	for _, r := range repos {
 		dest := reposDir + "/" + r.Name
 		clone := fmt.Sprintf("git clone -b %s %s %s",
@@ -174,7 +197,7 @@ func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, b
 
 // registerNode adds the node to the inventory of a deployment repo the
 // controller follows and commits + pushes the change.
-func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, location string, envs []string) error {
+func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, location, recipient string, envs []string) error {
 	r, dest, err := syncedRepo(ctx, home, repoName)
 	if err != nil {
 		return err
@@ -183,7 +206,7 @@ func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, l
 	if err != nil {
 		return err
 	}
-	if err := inv.AddNode(name, location, envs); err != nil {
+	if err := inv.AddNode(name, location, recipient, envs); err != nil {
 		return err
 	}
 	if err := repo.SaveInventory(dest, inv); err != nil {
@@ -228,6 +251,14 @@ func NodeSetEnv(ctx context.Context, home, repoName, name, env string, join bool
 		return err
 	}
 	log.Info("inventory updated", "node", name, "action", action, "env", env)
+
+	// A node that just joined must become a recipient of the env's secrets, or
+	// it cannot decrypt them on reconcile. Rekey so the new node is included.
+	if join {
+		if err := rekeyEnv(ctx, log, r, dest, home, env); err != nil {
+			return fmt.Errorf("rekey %s after adding node: %w", env, err)
+		}
+	}
 	return nil
 }
 
@@ -307,6 +338,239 @@ func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers
 
 	log.Info("node removed", "node", name)
 	return nil
+}
+
+// SecretsSet encrypts the plaintext YAML map of secrets for an environment's
+// stack and writes it to environments/<env>/secrets/<stack>.yml.age (commit +
+// push). The plaintext is validated as a flat KEY: value YAML map and never
+// stored or logged in clear.
+func SecretsSet(ctx context.Context, home, repoName, env, stack string, plaintext []byte, log *slog.Logger) error {
+	log = logger(log)
+	if env == "" || stack == "" {
+		return fmt.Errorf("secrets set requires an env and a stack")
+	}
+	var values map[string]string
+	if err := yaml.Unmarshal(plaintext, &values); err != nil {
+		return fmt.Errorf("secrets must be a flat YAML map of KEY: value: %w", err)
+	}
+	r, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return err
+	}
+	return writeSecrets(ctx, log, r, dest, home, env, stack, values)
+}
+
+// SecretsShow decrypts and returns the plaintext secrets for an environment's
+// stack, using the controller's own age identity.
+func SecretsShow(ctx context.Context, home, repoName, env, stack string) ([]byte, error) {
+	if env == "" || stack == "" {
+		return nil, fmt.Errorf("secrets show requires an env and a stack")
+	}
+	_, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(repo.SecretsFile(dest, env, stack))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no secrets for env %q stack %q", env, stack)
+		}
+		return nil, err
+	}
+	return secrets.Decrypt(secrets.KeyPath(home), data)
+}
+
+// SecretsEdit opens the decrypted secrets for an environment's stack in $EDITOR
+// (falling back to vi), then re-encrypts and writes the result. A missing file
+// starts from an empty template.
+func SecretsEdit(ctx context.Context, home, repoName, env, stack string, log *slog.Logger) error {
+	log = logger(log)
+	if env == "" || stack == "" {
+		return fmt.Errorf("secrets edit requires an env and a stack")
+	}
+	r, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return err
+	}
+
+	current := []byte("# Secrets for " + env + "/" + stack + " (flat KEY: value map).\n")
+	if data, err := os.ReadFile(repo.SecretsFile(dest, env, stack)); err == nil {
+		if current, err = secrets.Decrypt(secrets.KeyPath(home), data); err != nil {
+			return fmt.Errorf("decrypt existing secrets: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	edited, err := editInEditor(ctx, env+"-"+stack, current)
+	if err != nil {
+		return err
+	}
+	var values map[string]string
+	if err := yaml.Unmarshal(edited, &values); err != nil {
+		return fmt.Errorf("edited secrets are not a valid YAML map: %w", err)
+	}
+	return writeSecrets(ctx, log, r, dest, home, env, stack, values)
+}
+
+// SecretsRekey re-encrypts every secrets file of an environment for the current
+// recipient set (controller + the env's nodes). Run it after a node joins an
+// environment so the new node can decrypt the environment's secrets.
+func SecretsRekey(ctx context.Context, home, repoName, env string, log *slog.Logger) error {
+	log = logger(log)
+	if env == "" {
+		return fmt.Errorf("secrets rekey requires an env")
+	}
+	r, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return err
+	}
+	return rekeyEnv(ctx, log, r, dest, home, env)
+}
+
+// rekeyEnv re-encrypts every *.yml.age of an environment for the current
+// recipient set and pushes the change. It is a no-op (no commit) when the
+// environment has no secrets. Shared by SecretsRekey and NodeSetEnv.
+func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, env string) error {
+	recipients, err := envRecipients(home, dest, env)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(dest, "environments", env, "secrets")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Info("no secrets to rekey", "env", env)
+			return nil
+		}
+		return err
+	}
+
+	var changed []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yml.age") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return err
+		}
+		values, err := secrets.DecryptMap(secrets.KeyPath(home), data)
+		if err != nil {
+			return fmt.Errorf("decrypt %s: %w", e.Name(), err)
+		}
+		cipher, err := secrets.EncryptMap(recipients, values)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(full, cipher, 0o644); err != nil {
+			return err
+		}
+		changed = append(changed, filepath.Join("environments", env, "secrets", e.Name()))
+	}
+	if len(changed) == 0 {
+		log.Info("no secrets to rekey", "env", env)
+		return nil
+	}
+	msg := fmt.Sprintf("secrets: rekey %s for %d recipient(s)", env, len(recipients))
+	if err := gitsync.CommitPush(ctx, dest, r.Branch, msg, changed...); err != nil {
+		return err
+	}
+	log.Info("secrets rekeyed", "env", env, "files", len(changed), "recipients", len(recipients))
+	return nil
+}
+
+// writeSecrets encrypts values for the env's recipients and writes + pushes the
+// secrets file. Shared by SecretsSet and SecretsEdit.
+func writeSecrets(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, env, stack string, values map[string]string) error {
+	recipients, err := envRecipients(home, dest, env)
+	if err != nil {
+		return err
+	}
+	cipher, err := secrets.EncryptMap(recipients, values)
+	if err != nil {
+		return err
+	}
+	rel := filepath.Join("environments", env, "secrets", stack+".yml.age")
+	full := filepath.Join(dest, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(full, cipher, 0o644); err != nil {
+		return err
+	}
+	msg := fmt.Sprintf("secrets: update %s/%s", env, stack)
+	if err := gitsync.CommitPush(ctx, dest, r.Branch, msg, rel); err != nil {
+		return err
+	}
+	log.Info("secrets updated", "env", env, "stack", stack, "keys", len(values), "recipients", len(recipients))
+	return nil
+}
+
+// envRecipients returns the age recipients an environment's secrets are
+// encrypted for: the controller's own identity (so it can keep editing) plus
+// every participating node's recipient. The controller identity is created on
+// first use.
+func envRecipients(home, dest, env string) ([]string, error) {
+	controllerRecipient, created, err := secrets.LoadOrCreateIdentity(home)
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		slog.Default().Info("created controller age identity", "recipient", controllerRecipient)
+	}
+	inv, err := repo.LoadInventory(dest)
+	if err != nil {
+		return nil, err
+	}
+	recipients := append([]string{controllerRecipient}, inv.RecipientsForEnv(env)...)
+	return dedupeStrings(recipients), nil
+}
+
+// editInEditor writes content to a temp file, opens it in $EDITOR (or vi), and
+// returns the edited bytes.
+func editInEditor(ctx context.Context, name string, content []byte) ([]byte, error) {
+	f, err := os.CreateTemp("", "kompensator-secret-"+name+"-*.yml")
+	if err != nil {
+		return nil, err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	cmd := exec.CommandContext(ctx, editor, tmp)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("editor %q: %w", editor, err)
+	}
+	return os.ReadFile(tmp)
+}
+
+// dedupeStrings returns s without duplicates, preserving first-seen order.
+func dedupeStrings(s []string) []string {
+	seen := make(map[string]bool, len(s))
+	out := s[:0]
+	for _, v := range s {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // syncedRepo loads the home config, picks the deployment repo (by name or the
