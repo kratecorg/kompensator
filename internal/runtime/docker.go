@@ -183,11 +183,18 @@ func shortHealth(status string) string {
 // Images are pulled by compose only when missing. The GitOps model uses
 // immutable tags (new version = new tag), so a missing-pull is sufficient and
 // also lets locally-built images work without a registry.
+//
+// Deploy is only called once kompensator has decided a project must be
+// (re)deployed (image drift, config-hash change or --force). It therefore runs
+// with --force-recreate so changes Compose would not notice on its own — most
+// importantly the contents of bind-mounted config files such as haproxy.cfg —
+// are actually applied. On the in-sync path Deploy is not called at all, so
+// this never churns healthy containers needlessly.
 func Deploy(ctx context.Context, composeFile, project, node string, extraEnv []string) error {
 	cmd := exec.CommandContext(ctx, "docker", "compose",
 		"-p", project,
 		"-f", composeFile,
-		"up", "-d", "--remove-orphans",
+		"up", "-d", "--remove-orphans", "--force-recreate",
 	)
 	cmd.Env = append(os.Environ(), "NODE_NAME="+node)
 	cmd.Env = append(cmd.Env, extraEnv...)
