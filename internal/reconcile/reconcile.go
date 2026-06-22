@@ -16,6 +16,7 @@ import (
 
 	"kompensator/internal/config"
 	"kompensator/internal/gitsync"
+	"kompensator/internal/proxy"
 	"kompensator/internal/repo"
 	"kompensator/internal/runtime"
 	"kompensator/internal/secrets"
@@ -272,9 +273,20 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 			log.Info("stack not placed on this node, skipping", "stack", stackName, "node", names.Node)
 			continue
 		}
+
+		// Ensure the stack's reverse-proxy dynamic-config directory exists before
+		// its projects deploy: the stack's managed proxy bind-mounts it (PROXY_DIR)
+		// and Blue/Green projects write color-switch files into it.
+		if err := os.MkdirAll(proxyDir(opts.Home, names.Repo, opts.Env, stackName), 0o755); err != nil {
+			return res, fmt.Errorf("create proxy dir: %w", err)
+		}
+
 		stack, err := repo.LoadStack(repoRoot, stackName)
 		if err != nil {
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
+		}
+		if err := validateProxyBindings(stack); err != nil {
+			return res, err
 		}
 		state, err := repo.LoadStackState(repoRoot, opts.Env, stackName)
 		if err != nil {
@@ -298,8 +310,35 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 				res.Failed++
 			}
 		}
+
+		// The stack's managed proxy is deployed last: it routes to the projects
+		// above, so they (and the network a project owns) must exist first.
+		if stack.Proxy != nil {
+			if err := reconcileManagedProxy(ctx, log, names, opts, stackName, *stack.Proxy, &res); err != nil {
+				log.Error("managed proxy reconcile failed", "stack", stackName, "proxy", stack.Proxy.Name, "error", err)
+				res.Failed++
+			}
+		}
 	}
 	return res, nil
+}
+
+// validateProxyBindings checks that every project proxy binding in the stack
+// resolves to the stack's managed proxy. A binding without a managed proxy, or
+// targeting a name the stack does not provide, is a configuration error caught
+// here rather than producing routes nothing serves.
+func validateProxyBindings(stack repo.Stack) error {
+	for _, p := range stack.Projects {
+		for _, b := range p.Proxy {
+			if stack.Proxy == nil {
+				return fmt.Errorf("stack %q project %q declares a proxy binding but the stack has no managed proxy", stack.Name, p.Name)
+			}
+			if t := b.TargetName(); t != stack.Proxy.Name {
+				return fmt.Errorf("stack %q project %q proxy binding targets %q but the stack only provides proxy %q", stack.Name, p.Name, t, stack.Proxy.Name)
+			}
+		}
+	}
+	return nil
 }
 
 // loadSecretVars decrypts the stack's secrets file for the environment, if one
@@ -344,6 +383,18 @@ func deployStateDir(home string) string {
 	return filepath.Join(home, "deploy-state")
 }
 
+// proxyDir is the node-local directory a file-based reverse proxy watches for
+// dynamic configuration, scoped per deployment-repo, environment and stack.
+// kompensator writes Blue/Green color-switch files here, exposes it to compose
+// as PROXY_DIR, and bind-mounts it into the stack's managed proxy. The repo
+// segment keeps multiple deployment repos from colliding; the per-stack scope
+// keeps stacks fully isolated (one stack can never see or overwrite another's
+// routes). A synthesized managed proxy's compose file lives in a ".proxy"
+// subdirectory of this path.
+func proxyDir(home, repo, env, stack string) string {
+	return filepath.Join(home, "proxy", repo, env, stack)
+}
+
 // readDeployHash returns the last deployed config fingerprint for a project, or
 // "" when none was recorded yet (treated as drift so the next reconcile
 // re-establishes the baseline).
@@ -382,7 +433,7 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 		}
 	}
 
-	extraEnv, desiredRefs := buildEnv(opts.Env, vars, desired)
+	extraEnv, desiredRefs := buildEnv(opts.Env, proxyDir(opts.Home, names.Repo, opts.Env, stack), vars, desired)
 	composeFile := repo.ComposeFile(repoRoot, stack, p)
 
 	// The config hash folds the compose file and the effective deploy env
@@ -395,7 +446,7 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	}
 
 	if p.BlueGreen() {
-		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, res)
+		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, res)
 	}
 	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, res)
 }
@@ -448,8 +499,9 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 }
 
 // blueGreenProject deploys a project into the idle color, waits for it to
-// become healthy, verifies its images, then stops the previously active color.
-func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, res *Result) error {
+// become healthy, points the environment's reverse proxy at it (when the
+// project declares one), then stops the previously active color.
+func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, res *Result) error {
 	running, err := runningByColor(ctx, "", names, opts.Env, stack, project)
 	if err != nil {
 		return err
@@ -460,11 +512,15 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	hashKey := names.Project(opts.Env, stack, project, "")
 
 	// A color that fully serves the desired images AND matches the deployed
-	// config means we are in sync; stop any stale other color left behind by a
-	// prior switch. --force overrides.
+	// config means we are in sync; re-assert the proxy route (idempotent, and
+	// repairs a lost dynamic file) and stop any stale other color left behind by
+	// a prior switch. --force overrides.
 	active := colorServing(running, desiredRefs)
 	if active != "" && readDeployHash(opts.Home, hashKey) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs), "color", active)
+		if err := switchProxy(ctx, log, names, opts, stack, project, active, proxyBindings); err != nil {
+			return err
+		}
 		if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, active, running); err != nil {
 			return err
 		}
@@ -484,7 +540,11 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	}
 	log.Info(reason, "running", describeColors(running), "desired", describeRefs(desiredRefs), "target_color", target)
 
-	if err := runtime.Deploy(ctx, composeFile, targetProject, names.Node, extraEnv); err != nil {
+	// COLOR lets the compose file tag the new color's container (e.g. a network
+	// alias "<service>-<color>") so the reverse proxy can address it. It is not
+	// part of the config hash: alternating colors are intended, not drift.
+	colorEnv := append(append([]string(nil), extraEnv...), "COLOR="+target)
+	if err := runtime.Deploy(ctx, composeFile, targetProject, names.Node, colorEnv); err != nil {
 		return err
 	}
 	log.Info("waiting for new color to become healthy", "color", target, "project", targetProject)
@@ -501,6 +561,11 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	}
 	log.Info("new color healthy", "color", target, "images", describeRefs(desiredRefs))
 
+	// Cut traffic over to the new color before stopping the old one: the proxy
+	// switch is the atomic moment users experience the new version.
+	if err := switchProxy(ctx, log, names, opts, stack, project, target, proxyBindings); err != nil {
+		return err
+	}
 	if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, target, running); err != nil {
 		return err
 	}
@@ -513,17 +578,146 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	return nil
 }
 
+// switchProxy points the environment's reverse proxy at the given color for
+// every service the project routes. It is a no-op for projects without a proxy
+// binding. For each binding it resolves the active color's replica containers
+// and hands them to the Router as concrete backends, so the proxy load-balances
+// across every replica.
+func switchProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, stack, project, color string, bindings []repo.ProxyBinding) error {
+	if len(bindings) == 0 {
+		return nil
+	}
+	colorProject := names.Project(opts.Env, stack, project, color)
+	for _, binding := range bindings {
+		router, err := proxy.New(binding.Kind)
+		if err != nil {
+			return fmt.Errorf("proxy %q: %w", binding.Kind, err)
+		}
+		servers, err := runtime.ServiceEndpoints(ctx, "", colorProject, binding.Service)
+		if err != nil {
+			return fmt.Errorf("resolve %s replicas: %w", binding.Service, err)
+		}
+		t := proxy.Target{
+			Env:        opts.Env,
+			Stack:      stack,
+			Project:    project,
+			Router:     binding.RouterName(project),
+			Service:    binding.Service,
+			Port:       binding.Port,
+			Servers:    servers,
+			Rule:       binding.Rule,
+			Color:      color,
+			EntryPoint: binding.EntryPoint,
+			DynamicDir: proxyDir(opts.Home, names.Repo, opts.Env, stack),
+		}
+		if err := router.Switch(ctx, t); err != nil {
+			return fmt.Errorf("proxy %q switch: %w", binding.Kind, err)
+		}
+		log.Info("proxy switched", "proxy", binding.Kind, "router", t.Router, "service", binding.Service, "color", color, "replicas", len(servers))
+	}
+	return nil
+}
+
+// reconcileManagedProxy synthesizes and deploys a stack's internal reverse
+// proxy. kompensator renders the proxy's compose file from the ManagedProxy
+// declaration (the user never writes one), stores it under the stack's
+// dynamic-config directory, and deploys it as a recreate project. The deploy
+// env is just ENV_NAME — the only variable the generated compose references —
+// so stack/env variable churn never recreates the proxy; only a change to the
+// declaration itself (networks, publish, dynamic dir) does.
+func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, stack string, mp repo.ManagedProxy, res *Result) error {
+	project := "proxy-" + mp.Name
+	plog := log.With("stack", stack, "project", project, "strategy", "recreate", "proxy", mp.Kind)
+
+	router, err := proxy.New(mp.Kind)
+	if err != nil {
+		return err
+	}
+	prov, ok := router.(proxy.Provisioner)
+	if !ok {
+		return fmt.Errorf("proxy kind %q cannot be managed by kompensator", mp.Kind)
+	}
+
+	dynDir := proxyDir(opts.Home, names.Repo, opts.Env, stack)
+	nets := make([]proxy.ManagedNetwork, len(mp.Networks))
+	for i, n := range mp.Networks {
+		nets[i] = proxy.ManagedNetwork{Name: n.Name, Aliases: n.Aliases}
+	}
+	composeYAML, err := prov.Compose(proxy.ManagedSpec{
+		Name:       mp.Name,
+		Env:        opts.Env,
+		Stack:      stack,
+		DynamicDir: dynDir,
+		Networks:   nets,
+		Publish:    mp.Publish,
+	})
+	if err != nil {
+		return fmt.Errorf("render managed proxy: %w", err)
+	}
+
+	composePath := filepath.Join(dynDir, ".proxy", mp.Name+".yml")
+	if err := os.MkdirAll(filepath.Dir(composePath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(composePath, composeYAML, 0o644); err != nil {
+		return fmt.Errorf("write managed proxy compose: %w", err)
+	}
+
+	proj := names.Project(opts.Env, stack, project, "")
+	extraEnv := []string{"ENV_NAME=" + opts.Env}
+	configHash, err := computeConfigHash(composePath, extraEnv)
+	if err != nil {
+		return fmt.Errorf("config hash: %w", err)
+	}
+
+	running, err := runtime.ProjectImages(ctx, "", proj)
+	if err != nil {
+		return err
+	}
+	if len(running) > 0 && readDeployHash(opts.Home, proj) == configHash && !opts.Force {
+		plog.Info("in sync")
+		res.InSync++
+		return nil
+	}
+
+	reason := "managed proxy drift, deploying"
+	switch {
+	case opts.Force:
+		reason = "force redeploy managed proxy"
+	case len(running) > 0:
+		reason = "managed proxy config changed, recreating"
+	}
+	plog.Info(reason)
+
+	if err := runtime.Deploy(ctx, composePath, proj, names.Node, extraEnv); err != nil {
+		return err
+	}
+	if err := runtime.WaitHealthy(ctx, proj, healthTimeout); err != nil {
+		return fmt.Errorf("managed proxy not healthy: %w", err)
+	}
+	if err := writeDeployHash(opts.Home, proj, configHash); err != nil {
+		return err
+	}
+	plog.Info("deployed")
+	res.Deployed++
+	return nil
+}
+
 // buildEnv assembles the compose env vars for a deploy: the stack/env variables
-// (lowest precedence), the built-in ENV_NAME, and the per-service
+// (lowest precedence), the built-in ENV_NAME and PROXY_DIR, and the per-service
 // <SERVICE>_IMAGE / <SERVICE>_TAG values (highest precedence, so user variables
 // can never break image injection). NODE_NAME is added separately by Deploy. It
 // also returns the desired image ref per service.
-func buildEnv(envName string, vars map[string]string, desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
-	merged := make(map[string]string, len(vars)+len(desired)*2+1)
+func buildEnv(envName, proxyDir string, vars map[string]string, desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
+	merged := make(map[string]string, len(vars)+len(desired)*2+2)
 	for k, v := range vars {
 		merged[k] = v
 	}
 	merged["ENV_NAME"] = envName
+	// PROXY_DIR is the node-local directory a file-based reverse proxy watches
+	// for dynamic configuration. The proxy stack bind-mounts it; kompensator
+	// writes color-switch files into it (see internal/proxy).
+	merged["PROXY_DIR"] = proxyDir
 
 	refs = make(map[string]string, len(desired))
 	for svc, si := range desired {

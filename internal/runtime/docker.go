@@ -115,6 +115,66 @@ func ProjectImages(ctx context.Context, dockerHost, project string) (map[string]
 	return images, nil
 }
 
+// ServiceEndpoints returns one backend host per RUNNING container of a service
+// in a compose project, sorted, for a reverse proxy to load-balance across.
+//
+// It returns container IP addresses, not names. Compose names a container
+// "<project>-<service>-<n>", which a proxy on the same network could in
+// principle resolve via docker's embedded DNS — but that name is a single DNS
+// label and DNS labels are capped at 63 octets, so a long enough
+// repo/node/env/stack/project combination produces a name the embedded DNS
+// silently refuses to resolve. IP addresses sidestep that limit entirely and
+// still address each replica directly (real per-replica load balancing).
+// kompensator rewrites the proxy config on every deploy and re-asserts it on
+// every in-sync reconcile, so the IPs never go stale for long. dockerHost is
+// the docker "-H" endpoint ("" = local daemon).
+func ServiceEndpoints(ctx context.Context, dockerHost, project, service string) ([]string, error) {
+	out, err := output(ctx, "docker", dockerArgs(dockerHost,
+		"ps",
+		"--filter", "label=com.docker.compose.project="+project,
+		"--filter", "label=com.docker.compose.service="+service,
+		"--format", "{{.Names}}",
+	)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			names = append(names, line)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	sort.Strings(names)
+
+	// Resolve each container's IP. The template prints the IP of every network
+	// the container is attached to, space-separated; app services join a single
+	// network (the one shared with the proxy), so the first address is the one
+	// the proxy reaches it on. Containers are inspected in the (sorted) name
+	// order they are passed, keeping the result deterministic.
+	args := append([]string{"inspect",
+		"--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}"},
+		names...)
+	out, err = output(ctx, "docker", dockerArgs(dockerHost, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect: %w: %s", err, out)
+	}
+	var ips []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		ips = append(ips, fields[0])
+	}
+	if len(ips) != len(names) {
+		return nil, fmt.Errorf("resolved %d IP(s) for %d container(s) of service %q", len(ips), len(names), service)
+	}
+	return ips, nil
+}
+
 // ProjectContainers lists every container of a compose project (running or
 // stopped), one entry per replica, sorted by name. The short name is
 // "<service>-<replica-number>". dockerHost is the docker "-H" endpoint ("" =

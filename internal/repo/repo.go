@@ -426,9 +426,90 @@ func (e Environment) NodesRunningStack(stack string, projects, envNodes []string
 type Stack struct {
 	Name     string    `yaml:"name"`
 	Projects []Project `yaml:"projects"`
+	// Proxy, when set, makes kompensator run a stack-internal reverse proxy for
+	// this stack — there is no hand-written compose file for it. It is the
+	// default target of the stack's project proxy bindings (see ManagedProxy).
+	Proxy *ManagedProxy `yaml:"proxy,omitempty"`
 	// Variables are the stack's own default values for the variables its compose
 	// files reference. An environment may override any of them.
 	Variables map[string]string `yaml:"variables"`
+}
+
+// defaultProxyName is the logical name of a stack's managed proxy when the
+// stack does not name it explicitly. It is also the default target of the
+// stack's project proxy bindings.
+const defaultProxyName = "internal"
+
+// ManagedProxy declares a stack-internal reverse proxy that kompensator
+// synthesizes and runs for the stack itself: it renders the proxy container,
+// joins it to the stack's network(s), and feeds it the dynamic routing config
+// produced on each Blue/Green switch (see internal/proxy). The end user never
+// writes a compose file for it. A user-managed edge/global proxy placed in
+// front of the stack is a separate, advanced concern kompensator does not touch.
+//
+// In stack.yml it is written either as a bare kind (the common case) or as a
+// mapping for overrides:
+//
+//	proxy: traefik
+//
+//	proxy:
+//	  kind: traefik
+//	  networks: [carimco-${ENV_NAME}]
+//	  publish: ["8080:80"]
+type ManagedProxy struct {
+	// Name is the proxy's logical name within the stack (also its compose service
+	// name and the default target of the stack's bindings). Defaults to
+	// "internal".
+	Name string `yaml:"name,omitempty"`
+	// Kind selects the proxy implementation ("traefik", and later others). It
+	// must be a kind kompensator can provision.
+	Kind string `yaml:"kind"`
+	// Networks are the docker networks the proxy joins to reach the services it
+	// routes. They must already exist (a stack project owns them); names may
+	// reference ${ENV_NAME}. Defaults to the stack's conventional network
+	// "<stack>-${ENV_NAME}".
+	Networks []ProxyNetwork `yaml:"networks,omitempty"`
+	// Publish maps host ports onto the proxy, e.g. "8080:80". Empty means the
+	// proxy is only reachable in-cluster (e.g. chained behind a user-managed edge
+	// proxy that joins one of its networks).
+	Publish []string `yaml:"publish,omitempty"`
+}
+
+// UnmarshalYAML accepts either a bare kind (scalar, "traefik") or a mapping of
+// overrides, so both forms in stack.yml decode into a ManagedProxy.
+func (m *ManagedProxy) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&m.Kind)
+	}
+	type raw ManagedProxy
+	var r raw
+	if err := value.Decode(&r); err != nil {
+		return err
+	}
+	*m = ManagedProxy(r)
+	return nil
+}
+
+// ProxyNetwork is one docker network a managed proxy joins, with optional
+// aliases so another proxy can reach it under a stable name. It decodes from a
+// bare network name (scalar) or a mapping {name, aliases}.
+type ProxyNetwork struct {
+	Name    string   `yaml:"name"`
+	Aliases []string `yaml:"aliases,omitempty"`
+}
+
+// UnmarshalYAML accepts a scalar network name or a {name, aliases} mapping.
+func (n *ProxyNetwork) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&n.Name)
+	}
+	type raw ProxyNetwork
+	var r raw
+	if err := value.Decode(&r); err != nil {
+		return err
+	}
+	*n = ProxyNetwork(r)
+	return nil
 }
 
 // Project is one Docker Compose project within a stack. It switches Blue/Green
@@ -440,6 +521,53 @@ type Project struct {
 	Compose string `yaml:"compose"`
 	// Strategy is "blue-green" (default) or "recreate".
 	Strategy string `yaml:"strategy"`
+	// Proxy binds the project's Blue/Green switch to an environment reverse
+	// proxy: after the new color is healthy the reconcile points the proxy at
+	// it (see internal/proxy). A project may expose several services (e.g. a
+	// frontend and a backend), so it can declare one binding per routed service.
+	// Only meaningful for Blue/Green projects.
+	Proxy []ProxyBinding `yaml:"proxy,omitempty"`
+}
+
+// ProxyBinding declares which reverse proxy fronts a Blue/Green project and how
+// to route to it. It is proxy-agnostic; Kind selects the implementation.
+type ProxyBinding struct {
+	// Kind selects the proxy implementation ("traefik", and later "haproxy",
+	// "nginx", ...).
+	Kind string `yaml:"kind"`
+	// Router is the logical route name, unique within the environment's proxy.
+	// Defaults to the project name when empty.
+	Router string `yaml:"router,omitempty"`
+	// Service is the compose service to route to; Port is its container port.
+	// The active color is reached on the shared network as "<service>-<color>".
+	Service string `yaml:"service"`
+	Port    int    `yaml:"port"`
+	// Rule is the routing rule in Traefik syntax (e.g. PathPrefix(`/`)); empty
+	// matches everything. EntryPoint is the proxy listener name (proxy default
+	// when empty).
+	Rule       string `yaml:"rule,omitempty"`
+	EntryPoint string `yaml:"entryPoint,omitempty"`
+	// Target names the proxy that serves this route. It defaults to the stack's
+	// managed proxy ("internal"). Naming a different proxy is reserved for an
+	// advanced, user-managed setup.
+	Target string `yaml:"target,omitempty"`
+}
+
+// RouterName returns the binding's router name, defaulting to the project name.
+func (b ProxyBinding) RouterName(project string) string {
+	if b.Router != "" {
+		return b.Router
+	}
+	return project
+}
+
+// TargetName returns the proxy this binding routes through, defaulting to the
+// stack's managed proxy.
+func (b ProxyBinding) TargetName() string {
+	if b.Target != "" {
+		return b.Target
+	}
+	return defaultProxyName
 }
 
 // BlueGreen reports whether the project uses the Blue/Green strategy. Any value
@@ -536,9 +664,26 @@ func LoadStack(repoRoot, stack string) (Stack, error) {
 	if s.Name == "" {
 		s.Name = stack
 	}
+	if s.Proxy != nil {
+		if s.Proxy.Name == "" {
+			s.Proxy.Name = defaultProxyName
+		}
+		if len(s.Proxy.Networks) == 0 {
+			s.Proxy.Networks = []ProxyNetwork{{Name: s.Name + "-${ENV_NAME}"}}
+		}
+	}
 	for i := range s.Projects {
 		if s.Projects[i].Strategy == "" {
 			s.Projects[i].Strategy = StrategyBlueGreen
+		}
+		// A binding inherits the stack's managed proxy kind when it does not name
+		// one, so the common case needs no per-binding "kind".
+		if s.Proxy != nil {
+			for j := range s.Projects[i].Proxy {
+				if s.Projects[i].Proxy[j].Kind == "" {
+					s.Projects[i].Proxy[j].Kind = s.Proxy.Kind
+				}
+			}
 		}
 	}
 	return s, nil
