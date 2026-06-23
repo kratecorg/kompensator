@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -49,6 +48,10 @@ func main() {
 		os.Exit(cmdReconcile(g, rest))
 	case "status":
 		os.Exit(cmdStatus(g, rest))
+	case "controller":
+		os.Exit(cmdController(g, rest))
+	case "bootstrap":
+		os.Exit(cmdBootstrap(g, rest))
 	case "node":
 		os.Exit(cmdNode(g, rest))
 	case "secrets":
@@ -67,19 +70,21 @@ func main() {
 func cmdReconcile(g globals, args []string) int {
 	fs := flag.NewFlagSet("reconcile", flag.ContinueOnError)
 	force := fs.Bool("force", false, "redeploy even when the desired image is already running")
+	repoName := fs.String("repo", "", "limit to this repo (default: all configured repos)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] <env>")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] [--repo <name>] [<env>]")
+		fmt.Fprintln(os.Stderr, "  Omitting <env> reconciles every environment.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
 		return 2
 	}
-	if fs.NArg() != 1 {
+	if len(pos) > 1 {
 		fs.Usage()
-		fmt.Fprintln(os.Stderr, "  <env> is required.")
 		return 2
 	}
-	env := fs.Arg(0)
+	env := arg(pos, 0)
 
 	h, err := resolveHome(g.home)
 	if err != nil {
@@ -94,6 +99,7 @@ func cmdReconcile(g globals, args []string) int {
 	if _, err := reconcile.Run(ctx, reconcile.Options{
 		Home:    h,
 		Env:     env,
+		Repo:    *repoName,
 		Force:   *force,
 		JSONLog: g.jsonLog,
 		Logger:  log,
@@ -105,14 +111,21 @@ func cmdReconcile(g globals, args []string) int {
 }
 
 func cmdStatus(g globals, args []string) int {
-	if len(args) > 1 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] status [env]")
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "limit to this repo (default: all configured repos)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] status [--repo <name>] [<env>]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
 		return 2
 	}
-	env := "" // empty means: all environments this node participates in
-	if len(args) == 1 {
-		env = args[0]
+	if len(pos) > 1 {
+		fs.Usage()
+		return 2
 	}
+	env := arg(pos, 0) // empty means: all environments
 
 	h, err := resolveHome(g.home)
 	if err != nil {
@@ -123,7 +136,7 @@ func cmdStatus(g globals, args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	statuses, err := reconcile.Status(ctx, reconcile.Options{Home: h, Env: env})
+	statuses, err := reconcile.Status(ctx, reconcile.Options{Home: h, Env: env, Repo: *repoName})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -165,35 +178,101 @@ func resolveHome(home string) (string, error) {
 	return config.Home()
 }
 
-// splitCSV splits a comma-separated list into trimmed, non-empty items.
-func splitCSV(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
+// cmdController handles controller-home administration: initialising the home
+// and adding deployment repos to it.
+func cmdController(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] controller <init|repo> ...")
+		return 2
 	}
-	return out
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "init":
+		return cmdControllerInit(g, rest)
+	case "repo":
+		return cmdControllerRepo(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown controller subcommand: %s\n", sub)
+		return 2
+	}
 }
 
-// cmdNodeBootstrap provisions a new node from the controller: it copies the
-// kompensator binary, writes the node config (repos copied from the controller
-// config), clones the repo(s) on the node and registers it in the inventory.
-func cmdNodeBootstrap(g globals, args []string) int {
-	fs := flag.NewFlagSet("node bootstrap", flag.ContinueOnError)
+func cmdControllerInit(g globals, args []string) int {
+	fs := flag.NewFlagSet("controller init", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] controller init")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	log := newLogger(g.jsonLog)
+	if err := admin.ControllerInit(h, log); err != nil {
+		log.Error("controller init failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdControllerRepo(g globals, args []string) int {
+	if len(args) == 0 || args[0] != "add" {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] controller repo add <name> <url> [--branch <b>]")
+		return 2
+	}
+	fs := flag.NewFlagSet("controller repo add", flag.ContinueOnError)
+	branch := fs.String("branch", "main", "branch to track")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] controller repo add <name> <url> [--branch <b>]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args[1:])
+	if err != nil {
+		return 2
+	}
+	name, url := arg(pos, 0), arg(pos, 1)
+	if name == "" || url == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.ControllerAddRepo(ctx, h, name, url, *branch, log); err != nil {
+		log.Error("controller repo add failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdBootstrap provisions a new node from the controller: it copies the
+// kompensator binary, writes the node's node.yml (following one repo), clones
+// that repo on the node and registers it in the repo's inventory.
+func cmdBootstrap(g globals, args []string) int {
+	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	name := fs.String("name", "", "node name in the inventory")
 	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
-	envCSV := fs.String("env", "", "comma-separated environments to attach immediately (optional)")
-	invRepo := fs.String("repo-inventory", "", "which repo's inventory to register in (default: the sole repo)")
+	repoName := fs.String("repo", "", "which repo the node follows (default: the sole repo)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node bootstrap --name <node> --location <loc> [--env e1,e2]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>]")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
 	if err != nil {
 		return 2
 	}
-	// Allow the name to be given positionally too: node bootstrap <name> --location ...
+	// Allow the name to be given positionally too: bootstrap <name> --location ...
 	if *name == "" {
 		*name = arg(pos, 0)
 	}
@@ -212,11 +291,10 @@ func cmdNodeBootstrap(g globals, args []string) int {
 		ControllerHome: h,
 		Name:           *name,
 		Location:       *location,
-		Envs:           splitCSV(*envCSV),
-		InventoryRepo:  *invRepo,
+		RepoName:       *repoName,
 		Logger:         log,
 	}); err != nil {
-		log.Error("node bootstrap failed", "error", err)
+		log.Error("bootstrap failed", "error", err)
 		return 1
 	}
 	return 0
@@ -224,17 +302,11 @@ func cmdNodeBootstrap(g globals, args []string) int {
 
 func cmdNode(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <bootstrap|add|leave|rm> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <rm> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
-	case "bootstrap":
-		return cmdNodeBootstrap(g, rest)
-	case "add", "join":
-		return cmdNodeSetEnv(g, rest, true)
-	case "leave":
-		return cmdNodeSetEnv(g, rest, false)
 	case "rm", "remove":
 		return cmdNodeRemove(g, rest)
 	default:
@@ -273,43 +345,6 @@ func cmdNodeRemove(g globals, args []string) int {
 	log := newLogger(g.jsonLog)
 	if err := admin.NodeRemove(ctx, h, *repoName, name, *keepContainers, *keepHome, log); err != nil {
 		log.Error("node rm failed", "error", err)
-		return 1
-	}
-	return 0
-}
-
-func cmdNodeSetEnv(g globals, args []string, join bool) int {
-	verb := "leave"
-	if join {
-		verb = "add"
-	}
-	fs := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
-	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: kompensator [global flags] node %s <name> <env> [--repo <name>]\n", verb)
-		fs.PrintDefaults()
-	}
-	pos, err := parseFlagsAndArgs(fs, args)
-	if err != nil {
-		return 2
-	}
-	name, env := arg(pos, 0), arg(pos, 1)
-	if name == "" || env == "" {
-		fs.Usage()
-		return 2
-	}
-
-	h, err := resolveHome(g.home)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	log := newLogger(g.jsonLog)
-	if err := admin.NodeSetEnv(ctx, h, *repoName, name, env, join, log); err != nil {
-		log.Error("node "+verb+" failed", "error", err)
 		return 1
 	}
 	return 0
@@ -525,34 +560,44 @@ Global flags (must come before the command):
   -home string   kompensator home directory (default: $KOMPENSATOR_HOME or ~/.config/kompensator)
   -json          emit structured JSON logs (for journald/Loki)
 
+A kompensator home is either a controller (controller.yml, tracks one or more
+repos and drives the nodes) or a node (node.yml, follows one repo and reconciles
+itself). The role is detected from which config the home holds.
+
 Commands:
-  reconcile <env>   Pull deployment repo(s) and deploy on drift (env required)
-                    --force  redeploy even when already in sync
-  status [env]      Show target vs. running images; no env shows all environments
-  node bootstrap    Provision a new node from the controller: copy the binary,
-                    write its config (repos from the controller), clone the
-                    repo(s) on it and register it in the inventory
-                    --name <node> --location <loc> [--env e1,e2]
-  node add <name> <env>     Attach a node to an environment
-  node leave <name> <env>   Detach a node from an environment
+  reconcile [env]   Pull deployment repo(s) and deploy on drift; no env
+                    reconciles every environment
+                    --force         redeploy even when already in sync
+                    --repo <name>   limit to one repo (default: all)
+  status [env]      Show target vs. running images; no env shows all
+                    environments. --repo <name> limits to one repo
+  controller init   Initialise a controller home (writes controller.yml)
+  controller repo add <name> <url> [--branch <b>]
+                    Add a deployment repo to the controller and clone it
+  bootstrap         Provision a new node from the controller: copy the binary,
+                    write its node.yml (following one repo), clone that repo on
+                    it and register it in the repo's inventory
+                    --name <node> --location <loc> [--repo <name>]
   node rm <name>    Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
+                    --repo <name>   which repo's inventory (default: the sole one)
   secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
                                secrets for an environment's stack
   secrets show <env> <stack>   Decrypt and print an environment's stack secrets
   secrets edit <env> <stack>   Edit an environment's stack secrets in $EDITOR
   secrets rekey <env>          Re-encrypt an environment's secrets for the
-                               current recipient set (run after a node joins)
+                               current recipient set
   version           Print version
   help              Show this help
 
 Examples:
+  kompensator reconcile
   kompensator reconcile dev
   kompensator -json reconcile dev
   kompensator status
-  kompensator -home /opt/controller status dev
-  kompensator -home /opt/controller node bootstrap --name node7 --location ssh://peter@host.example.org
-  kompensator -home /opt/controller node add node7 dev
+  kompensator -home /opt/controller controller init
+  kompensator -home /opt/controller controller repo add prod ssh://git@example.org/org/deploy.git
+  kompensator -home /opt/controller bootstrap --name node7 --location ssh://peter@host.example.org
   kompensator -home /opt/controller node rm node7
   echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
   kompensator -home /opt/controller secrets rekey prod

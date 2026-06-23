@@ -29,9 +29,10 @@ const healthTimeout = 5 * time.Minute
 // Options controls a reconcile run.
 type Options struct {
 	Home    string
-	Env     string
-	Force   bool // redeploy even when the desired images are already running
-	JSONLog bool // pass -json through to node agents (controller mode)
+	Env     string // empty means: every environment (in the selected repos)
+	Repo    string // empty means: every configured repo; else only this repo
+	Force   bool   // redeploy even when the desired images are already running
+	JSONLog bool   // pass -json through to node agents (controller mode)
 	Logger  *slog.Logger
 }
 
@@ -43,12 +44,16 @@ type Result struct {
 	Failed   int
 }
 
-// Run performs a reconcile. On a node agent (config has node.name) it does a
-// single local pass: sync each deployment repo, resolve the stacks/projects
-// placed on this node for the environment, and deploy any that have drifted. On
-// a controller (config has no node.name) it instead triggers each participating
-// node's agent — locally by re-executing itself with the node's home, or
-// remotely over ssh.
+// Run performs a reconcile. On a node agent (node.yml) it does a single local
+// pass per environment: sync the followed repo, resolve the stacks/projects
+// placed on this node, and deploy any that have drifted. On a controller
+// (controller.yml) it instead triggers each participating node's agent —
+// locally by re-executing itself with the node's home, or remotely over ssh.
+//
+// When opts.Env is empty it reconciles every environment found in the selected
+// repos; when opts.Repo is empty it acts on every configured repo. The home
+// lock is held for the whole run so all environments reconcile atomically with
+// respect to other runs.
 func Run(ctx context.Context, opts Options) (Result, error) {
 	log := opts.Logger
 	if log == nil {
@@ -60,14 +65,6 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		return Result{}, err
 	}
 
-	if cfg.IsController() {
-		return runController(ctx, log, opts, cfg)
-	}
-	return runNode(ctx, log, opts, cfg)
-}
-
-// runNode is the node-local reconcile pass (cron and manual entrypoint).
-func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) (Result, error) {
 	unlock, held, err := lock(opts.Home)
 	if err != nil {
 		return Result{}, err
@@ -78,11 +75,95 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 	}
 	defer unlock()
 
-	log = log.With("node", cfg.Node.Name, "env", opts.Env)
-	log.Info("reconcile started")
+	envs := []string{opts.Env}
+	if opts.Env == "" {
+		envs, err = resolveEnvs(ctx, log, opts, cfg)
+		if err != nil {
+			return Result{}, err
+		}
+		if len(envs) == 0 {
+			log.Info("no environments to reconcile")
+			return Result{}, nil
+		}
+		log.Info("reconciling all environments", "envs", strings.Join(envs, ","))
+	}
 
 	var total Result
-	for _, r := range cfg.Repos {
+	for _, env := range envs {
+		o := opts
+		o.Env = env
+		var res Result
+		if cfg.IsController() {
+			res, err = runController(ctx, log, o, cfg)
+		} else {
+			res, err = runNode(ctx, log, o, cfg)
+		}
+		total.add(res)
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+// filterRepos returns the configured repos, narrowed to one by name when repo
+// is non-empty. An unknown name is an error.
+func filterRepos(repos []config.Repo, repo string) ([]config.Repo, error) {
+	if repo == "" {
+		return repos, nil
+	}
+	for _, r := range repos {
+		if r.Name == repo {
+			return []config.Repo{r}, nil
+		}
+	}
+	return nil, fmt.Errorf("repo %q not configured", repo)
+}
+
+// resolveEnvs syncs the selected repos and returns the union of environments
+// they define, deduplicated and sorted.
+func resolveEnvs(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) ([]string, error) {
+	repos, err := filterRepos(cfg.Repos, opts.Repo)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var envs []string
+	for _, r := range repos {
+		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
+		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
+		if err != nil {
+			return nil, fmt.Errorf("sync repo %q: %w", r.Name, err)
+		}
+		log.Info("repo synced", "repo", r.Name, "commit", commit)
+		es, err := repo.ListEnvironments(dest)
+		if err != nil {
+			return nil, fmt.Errorf("repo %q: %w", r.Name, err)
+		}
+		for _, e := range es {
+			if !seen[e] {
+				seen[e] = true
+				envs = append(envs, e)
+			}
+		}
+	}
+	sort.Strings(envs)
+	return envs, nil
+}
+
+// runNode is the node-local reconcile pass (cron and manual entrypoint). The
+// home lock is already held by Run.
+func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) (Result, error) {
+	log = log.With("node", cfg.NodeName, "env", opts.Env)
+	log.Info("reconcile started")
+
+	repos, err := filterRepos(cfg.Repos, opts.Repo)
+	if err != nil {
+		return Result{}, err
+	}
+
+	var total Result
+	for _, r := range repos {
 		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
 		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
 		if err != nil {
@@ -91,7 +172,7 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 		log.Info("repo synced", "repo", r.Name, "commit", commit)
 
 		names := runtime.Names{
-			Repo: r.Name, Node: cfg.Node.Name,
+			Repo: r.Name, Node: cfg.NodeName,
 			IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
 		}
 		res, err := reconcileRepo(ctx, log, names, opts, dest)
@@ -116,18 +197,8 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 // runController triggers reconcile on every node that participates in the
 // environment. Nodes are processed one at a time so a Blue/Green rollout never
 // runs on two nodes simultaneously. A failure on one node is recorded and the
-// rest still run.
+// rest still run. The home lock is already held by Run.
 func runController(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) (Result, error) {
-	unlock, held, err := lock(opts.Home)
-	if err != nil {
-		return Result{}, err
-	}
-	if !held {
-		log.Info("another controller run is in progress, skipping")
-		return Result{}, nil
-	}
-	defer unlock()
-
 	clog := log.With("controller", true, "env", opts.Env)
 	clog.Info("controller reconcile started")
 
@@ -165,13 +236,19 @@ type reconcileTarget struct {
 	loc  repo.Location
 }
 
-// reconcileTargets syncs the controller's repos and returns the nodes that
-// participate in the environment, deduplicated by name. Every such node must
-// declare a location so the controller can reach it.
+// reconcileTargets syncs the controller's repos and returns the nodes that run
+// at least one stack of the environment, deduplicated by LOCATION (host+path).
+// Two repos that share a node name but point at different homes are distinct
+// targets; the same home reached via two repos is triggered once. Every such
+// node must declare a location so the controller can reach it.
 func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config) ([]reconcileTarget, error) {
+	repos, err := filterRepos(cfg.Repos, opts.Repo)
+	if err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	var targets []reconcileTarget
-	for _, r := range cfg.Repos {
+	for _, r := range repos {
 		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
 		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
 		if err != nil {
@@ -179,16 +256,19 @@ func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *
 		}
 		log.Info("repo synced", "repo", r.Name, "commit", commit)
 
+		env, err := repo.LoadEnvironment(dest, opts.Env)
+		if err != nil {
+			// This repo does not define the environment; nothing to trigger.
+			log.Info("env not defined in repo, skipping", "repo", r.Name, "env", opts.Env)
+			continue
+		}
 		inv, err := repo.LoadInventory(dest)
 		if err != nil {
 			return nil, fmt.Errorf("repo %q: %w", r.Name, err)
 		}
 		for _, n := range inv.Nodes {
-			if !inv.InEnv(n.Name, opts.Env) {
-				continue // node not in this environment
-			}
-			if seen[n.Name] {
-				continue
+			if !env.RunsOnNode(n.Name) {
+				continue // every stack pinned away from this node
 			}
 			if n.Location == "" {
 				return nil, fmt.Errorf("node %q has no location; controller cannot trigger reconcile", n.Name)
@@ -197,7 +277,11 @@ func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *
 			if err != nil {
 				return nil, fmt.Errorf("node %q: %w", n.Name, err)
 			}
-			seen[n.Name] = true
+			key := loc.String()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			targets = append(targets, reconcileTarget{name: n.Name, loc: loc})
 		}
 	}
@@ -249,18 +333,15 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot string) (Result, error) {
 	var res Result
 
-	inv, err := repo.LoadInventory(repoRoot)
-	if err != nil {
-		return res, err
-	}
-	if !inv.InEnv(names.Node, opts.Env) {
-		log.Info("node not in this repo's env, skipping repo", "repo", repoRoot)
-		return res, nil
-	}
-
 	env, err := repo.LoadEnvironment(repoRoot, opts.Env)
 	if err != nil {
-		return res, err
+		// This repo does not define the environment; nothing to do here.
+		log.Info("env not defined in this repo, skipping repo", "repo", repoRoot, "env", opts.Env)
+		return res, nil
+	}
+	if !env.RunsOnNode(names.Node) {
+		log.Info("node runs no stack of this env, skipping repo", "repo", repoRoot, "node", names.Node)
+		return res, nil
 	}
 	if len(env.Stacks) == 0 {
 		log.Info("env hosts no stacks")
@@ -908,8 +989,13 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 	}
 	canPull := held
 
+	repos, err := filterRepos(cfg.Repos, opts.Repo)
+	if err != nil {
+		return nil, err
+	}
+
 	var out []ServiceStatus
-	for _, r := range cfg.Repos {
+	for _, r := range repos {
 		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
 		if canPull {
 			if _, err := gitsync.Sync(ctx, r.URL, r.Branch, dest); err != nil {
@@ -922,20 +1008,21 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 			return out, fmt.Errorf("repo %q: %w", r.Name, err)
 		}
 
-		targets, err := statusTargets(inv, cfg.Node.Name)
+		targets, err := statusTargets(inv, cfg.NodeName)
 		if err != nil {
 			return out, fmt.Errorf("repo %q: %w", r.Name, err)
 		}
 
+		envs, err := statusEnvs(dest, opts.Env)
+		if err != nil {
+			return out, fmt.Errorf("repo %q: %w", r.Name, err)
+		}
 		for _, t := range targets {
 			names := runtime.Names{
 				Repo: r.Name, Node: t.node,
 				IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
 			}
-			for _, env := range statusEnvs(inv, t.node, opts.Env) {
-				if !inv.InEnv(t.node, env) {
-					continue
-				}
+			for _, env := range envs {
 				rows, err := statusEnv(ctx, dest, names, t, env)
 				if err != nil {
 					return out, err
@@ -948,11 +1035,14 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 }
 
 // statusEnv reports every service of every stack placed in one environment on
-// one node.
+// one node. It is a no-op when the node runs no stack of the environment.
 func statusEnv(ctx context.Context, repoRoot string, names runtime.Names, t statusTarget, env string) ([]ServiceStatus, error) {
 	e, err := repo.LoadEnvironment(repoRoot, env)
 	if err != nil {
 		return nil, fmt.Errorf("repo %q env %q: %w", names.Repo, env, err)
+	}
+	if !e.RunsOnNode(t.node) {
+		return nil, nil // every stack pinned away from this node
 	}
 
 	var out []ServiceStatus
@@ -1103,13 +1193,13 @@ func statusTargets(inv repo.Inventory, selfNode string) ([]statusTarget, error) 
 	return targets, nil
 }
 
-// statusEnvs returns the environments to report for a node. When env is set it
-// is used as-is; otherwise all envs the node participates in are returned.
-func statusEnvs(inv repo.Inventory, node, env string) []string {
+// statusEnvs returns the environments to report. When env is set it is used
+// as-is; otherwise every environment defined in the repo is returned.
+func statusEnvs(repoRoot, env string) ([]string, error) {
 	if env != "" {
-		return []string{env}
+		return []string{env}, nil
 	}
-	return inv.EnvsForNode(node)
+	return repo.ListEnvironments(repoRoot)
 }
 
 // lock takes an exclusive, non-blocking flock on <home>/kompensator.lock so a

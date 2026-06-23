@@ -13,7 +13,9 @@ import (
 )
 
 // inventoryHeader is prepended to a kompensator-managed inventory/nodes.yml.
-const inventoryHeader = "# Nodes and the environments they participate in (managed by kompensator).\n" +
+const inventoryHeader = "# Nodes known to this deployment repo (managed by kompensator).\n" +
+	"# Nodes are just nodes; which node runs which environment is decided by the\n" +
+	"# environment definitions (environments/<env>/env.yml), not here.\n" +
 	"# location: an absolute path (local node) or ssh://[user@]host[:port]/path (remote).\n"
 
 // Deploy strategies for a project.
@@ -22,15 +24,17 @@ const (
 	StrategyRecreate  = "recreate"
 )
 
-// Inventory is the set of nodes and the environments they participate in,
-// stored at inventory/nodes.yml in the deployment repo.
+// Inventory is the set of nodes a deployment repo knows about, stored at
+// inventory/nodes.yml. Nodes are just nodes: which node runs which environment
+// is decided entirely by the environment definitions, not here.
 type Inventory struct {
 	Nodes []Node `yaml:"nodes"`
 }
 
-// Node is one host in the inventory. A node participates in a set of
-// environments and runs every stack (and project) placed in those
-// environments; there are no roles.
+// Node is one host in the inventory. Every node is a candidate for every
+// environment defined in the repo; an environment (or a stack/project within
+// it) may pin itself to a node subset, but the inventory itself carries no
+// environment membership.
 type Node struct {
 	Name string `yaml:"name"`
 	// Location tells a controller how to reach the node's kompensator home.
@@ -39,8 +43,6 @@ type Node struct {
 	// the node's KOMPENSATOR_HOME, kept for remote agent operations; the docker
 	// status is read from the derived endpoint (local daemon or ssh://).
 	Location string `yaml:"location"`
-	// Environments this node participates in.
-	Environments []string `yaml:"environments"`
 	// AgeRecipient is the node's public age key ("age1..."). The controller
 	// encrypts environment secrets for every node's recipient; the node
 	// decrypts them locally with its private key. Empty for nodes provisioned
@@ -116,34 +118,14 @@ func (l Location) String() string {
 	return "ssh://" + host + l.Path
 }
 
-// InEnv reports whether the named node participates in the environment.
-func (inv Inventory) InEnv(node, env string) bool {
-	for _, n := range inv.Nodes {
-		if n.Name != node {
-			continue
-		}
-		for _, e := range n.Environments {
-			if e == env {
-				return true
-			}
-		}
-		return false
+// AllNodeNames returns the names of every node in the inventory, in order.
+// Every node is a candidate for every environment; placement narrows this.
+func (inv Inventory) AllNodeNames() []string {
+	names := make([]string, len(inv.Nodes))
+	for i, n := range inv.Nodes {
+		names[i] = n.Name
 	}
-	return false
-}
-
-// EnvsForNode returns the sorted list of environments the named node
-// participates in, or nil if the node is not in the inventory.
-func (inv Inventory) EnvsForNode(node string) []string {
-	for _, n := range inv.Nodes {
-		if n.Name != node {
-			continue
-		}
-		envs := append([]string(nil), n.Environments...)
-		sort.Strings(envs)
-		return envs
-	}
-	return nil
+	return names
 }
 
 // RecipientsForNodes returns the age recipients of the named nodes that have a
@@ -164,21 +146,6 @@ func (inv Inventory) RecipientsForNodes(names []string) []string {
 	return recipients
 }
 
-// NodesForEnv returns the names of every node that participates in the
-// environment, in inventory order.
-func (inv Inventory) NodesForEnv(env string) []string {
-	var names []string
-	for _, n := range inv.Nodes {
-		for _, e := range n.Environments {
-			if e == env {
-				names = append(names, n.Name)
-				break
-			}
-		}
-	}
-	return names
-}
-
 // index returns the position of the named node, or -1 if absent.
 func (inv *Inventory) index(name string) int {
 	for i := range inv.Nodes {
@@ -195,13 +162,11 @@ func (inv *Inventory) Has(name string) bool {
 }
 
 // AddNode appends a node. It errors if a node of that name already exists.
-func (inv *Inventory) AddNode(name, location, ageRecipient string, envs []string) error {
+func (inv *Inventory) AddNode(name, location, ageRecipient string) error {
 	if inv.index(name) >= 0 {
 		return fmt.Errorf("node %q already in inventory", name)
 	}
-	sorted := append([]string(nil), envs...)
-	sort.Strings(sorted)
-	inv.Nodes = append(inv.Nodes, Node{Name: name, Location: location, Environments: sorted, AgeRecipient: ageRecipient})
+	inv.Nodes = append(inv.Nodes, Node{Name: name, Location: location, AgeRecipient: ageRecipient})
 	return nil
 }
 
@@ -214,38 +179,6 @@ func (inv *Inventory) RemoveNode(name string) (Node, error) {
 	n := inv.Nodes[i]
 	inv.Nodes = append(inv.Nodes[:i], inv.Nodes[i+1:]...)
 	return n, nil
-}
-
-// JoinEnv adds the node to an environment (no-op if already a member).
-func (inv *Inventory) JoinEnv(name, env string) error {
-	i := inv.index(name)
-	if i < 0 {
-		return fmt.Errorf("node %q not in inventory", name)
-	}
-	for _, e := range inv.Nodes[i].Environments {
-		if e == env {
-			return nil
-		}
-	}
-	inv.Nodes[i].Environments = append(inv.Nodes[i].Environments, env)
-	sort.Strings(inv.Nodes[i].Environments)
-	return nil
-}
-
-// LeaveEnv removes the node from an environment (no-op if not a member).
-func (inv *Inventory) LeaveEnv(name, env string) error {
-	i := inv.index(name)
-	if i < 0 {
-		return fmt.Errorf("node %q not in inventory", name)
-	}
-	out := make([]string, 0, len(inv.Nodes[i].Environments))
-	for _, e := range inv.Nodes[i].Environments {
-		if e != env {
-			out = append(out, e)
-		}
-	}
-	inv.Nodes[i].Environments = out
-	return nil
 }
 
 // Environment is a deployment target, stored at environments/<env>/env.yml. It
@@ -419,6 +352,18 @@ func (e Environment) NodesRunningStack(stack string, projects, envNodes []string
 		}
 	}
 	return out
+}
+
+// RunsOnNode reports whether the named node runs at least one stack of this
+// environment, i.e. is a deploy target for it. A node runs the environment
+// unless every stack is pinned away from it.
+func (e Environment) RunsOnNode(node string) bool {
+	for _, p := range e.Stacks {
+		if p.StackRunsOn(node) {
+			return true
+		}
+	}
+	return false
 }
 
 // Stack is the env-independent definition of a set of compose projects, stored
@@ -648,6 +593,33 @@ func LoadEnvironment(repoRoot, env string) (Environment, error) {
 		e.Name = env
 	}
 	return e, nil
+}
+
+// ListEnvironments returns the names of every environment defined in the repo
+// (every environments/<env>/ directory that holds an env.yml), sorted. It is
+// the source of truth for which environments exist, since nodes no longer carry
+// environment membership.
+func ListEnvironments(repoRoot string) ([]string, error) {
+	dir := filepath.Join(repoRoot, "environments")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read environments dir: %w", err)
+	}
+	var envs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, e.Name(), "env.yml")); err != nil {
+			continue
+		}
+		envs = append(envs, e.Name())
+	}
+	sort.Strings(envs)
+	return envs, nil
 }
 
 // StackDir returns the absolute path to a stack's definition directory.

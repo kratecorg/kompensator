@@ -30,40 +30,97 @@ import (
 // location omits the path.
 const defaultNodeHome = ".config/kompensator"
 
+// ControllerInit initialises a controller home: it writes an empty
+// controller.yml. It refuses to clobber a home that already holds a config.
+func ControllerInit(home string, log *slog.Logger) error {
+	log = logger(log)
+	if config.IsOccupied(home) {
+		return fmt.Errorf("home %s already holds a kompensator config", home)
+	}
+	if err := config.WriteController(home, nil, nil); err != nil {
+		return err
+	}
+	log.Info("controller initialised", "home", home, "config", config.ControllerFile)
+	return nil
+}
+
+// ControllerAddRepo adds a deployment repo to the controller config and clones
+// it into the controller's repos directory.
+func ControllerAddRepo(ctx context.Context, home, name, url, branch string, log *slog.Logger) error {
+	log = logger(log)
+	if name == "" || url == "" {
+		return fmt.Errorf("controller repo add requires a name and a url")
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	cfg, err := config.Load(home)
+	if err != nil {
+		return err
+	}
+	if !cfg.IsController() {
+		return fmt.Errorf("controller repo add must run from a controller home (%s)", config.ControllerFile)
+	}
+	for _, r := range cfg.Repos {
+		if r.Name == name {
+			return fmt.Errorf("repo %q already configured", name)
+		}
+	}
+	repos := append(append([]config.Repo(nil), cfg.Repos...), config.Repo{Name: name, URL: url, Branch: branch})
+	if err := config.WriteController(home, repos, cfg.Naming); err != nil {
+		return err
+	}
+	dest := filepath.Join(config.ReposDir(home), name)
+	commit, err := gitsync.Sync(ctx, url, branch, dest)
+	if err != nil {
+		return fmt.Errorf("clone repo %q: %w", name, err)
+	}
+	log.Info("repo added", "repo", name, "url", url, "branch", branch, "commit", commit)
+	return nil
+}
+
 // ProvisionOptions configures provisioning a new node from the controller.
 type ProvisionOptions struct {
-	ControllerHome string   // the controller's kompensator home (source of repos)
-	Name           string   // node name in the inventory
-	Location       string   // ssh://[user@]host[:port][/path] or an absolute local path
-	Envs           []string // optional environments to attach immediately
-	InventoryRepo  string   // which repo's inventory to register in (default: sole repo)
+	ControllerHome string // the controller's kompensator home (source of repos)
+	Name           string // node name in the inventory
+	Location       string // ssh://[user@]host[:port][/path] or an absolute local path
+	RepoName       string // which repo the node follows (default: the sole repo)
 	Logger         *slog.Logger
 }
 
 // ProvisionNode materialises a new node entirely from the controller: it copies
-// the kompensator binary, writes the node-local config (the repos are taken
-// from the controller's config), clones the deployment repo(s) on the node and
-// registers the node in the inventory (commit + push). The node itself only
-// needs read access to the repos; the controller performs the inventory write.
+// the kompensator binary, writes the node-local config (the single repo the
+// node follows is taken from the controller's config), clones that repo on the
+// node and registers the node in the repo's inventory (commit + push). The node
+// itself only needs read access to the repo; the controller performs the
+// inventory write. After registration it rekeys the repo's environments so the
+// new node becomes a recipient of their secrets.
 func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 	log := logger(opts.Logger)
 	if opts.Name == "" {
-		return fmt.Errorf("node bootstrap requires --name")
+		return fmt.Errorf("bootstrap requires --name")
 	}
 	if opts.Location == "" {
-		return fmt.Errorf("node bootstrap requires --location")
+		return fmt.Errorf("bootstrap requires --location")
 	}
 
 	ctrlCfg, err := config.Load(opts.ControllerHome)
 	if err != nil {
 		return fmt.Errorf("load controller config: %w", err)
 	}
-	if len(ctrlCfg.Repos) == 0 {
-		return fmt.Errorf("controller config has no repos to copy to the node")
+	if !ctrlCfg.IsController() {
+		return fmt.Errorf("bootstrap must run from a controller home (%s)", config.ControllerFile)
+	}
+	r, err := pickRepo(ctrlCfg.Repos, opts.RepoName)
+	if err != nil {
+		return err
 	}
 
 	loc, err := resolveNodeLocation(ctx, opts.Location)
 	if err != nil {
+		return err
+	}
+	if err := ensureFreeHome(ctx, loc); err != nil {
 		return err
 	}
 
@@ -72,8 +129,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("resolve own binary: %w", err)
 	}
 
-	nodeCfg := config.Config{Node: config.Node{Name: opts.Name}, Naming: ctrlCfg.Naming, Repos: ctrlCfg.Repos}
-	cfgData, err := config.Marshal(nodeCfg)
+	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming)
 	if err != nil {
 		return err
 	}
@@ -86,16 +142,16 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 	}
 
 	if loc.Local {
-		err = provisionLocal(ctx, log, loc, self, cfgData, privateKey, nodeCfg.Repos)
+		err = provisionLocal(ctx, log, loc, self, cfgData, privateKey, r)
 	} else {
-		err = provisionRemote(ctx, log, loc, self, cfgData, privateKey, nodeCfg.Repos)
+		err = provisionRemote(ctx, log, loc, self, cfgData, privateKey, r)
 	}
 	if err != nil {
 		return err
 	}
-	log.Info("node provisioned", "node", opts.Name, "location", loc.String())
+	log.Info("node provisioned", "node", opts.Name, "repo", r.Name, "location", loc.String())
 
-	return registerNode(ctx, log, opts.ControllerHome, opts.InventoryRepo, opts.Name, loc.String(), recipient, opts.Envs)
+	return registerNode(ctx, log, opts.ControllerHome, r.Name, opts.Name, loc.String(), recipient)
 }
 
 // resolveNodeLocation parses a provisioning location. For an ssh location with
@@ -119,9 +175,56 @@ func resolveNodeLocation(ctx context.Context, raw string) (repo.Location, error)
 	return loc, nil
 }
 
+// ensureFreeHome rejects a location whose home already holds a kompensator
+// config, suggesting the next free sibling home (…/kompensator2, …3, …) so a
+// host can run several agents, one per repo, in separate homes.
+func ensureFreeHome(ctx context.Context, loc repo.Location) error {
+	occupied, err := homeOccupied(ctx, loc)
+	if err != nil {
+		return err
+	}
+	if !occupied {
+		return nil
+	}
+	suggestion := suggestFreeHome(ctx, loc)
+	return fmt.Errorf("home %s already holds a kompensator config; one home follows one repo. Use a separate home, e.g. --location %s", loc.String(), suggestion)
+}
+
+// homeOccupied reports whether the location already holds a controller.yml or
+// node.yml.
+func homeOccupied(ctx context.Context, loc repo.Location) (bool, error) {
+	if loc.Local {
+		return config.IsOccupied(loc.Path), nil
+	}
+	test := fmt.Sprintf("test -e %s || test -e %s",
+		shellQuote(loc.Path+"/"+config.ControllerFile),
+		shellQuote(loc.Path+"/"+config.NodeFile))
+	// remoteRun returns nil when the test command succeeds (a config exists).
+	if err := remoteRun(ctx, loc, test); err == nil {
+		return true, nil
+	}
+	return false, nil
+}
+
+// suggestFreeHome returns a location whose home is not yet occupied by appending
+// an increasing suffix to the home path's last segment. It gives up after a few
+// tries and returns the last candidate so the user always gets a hint.
+func suggestFreeHome(ctx context.Context, loc repo.Location) string {
+	base := strings.TrimRight(loc.Path, "/")
+	cand := loc
+	for i := 2; i <= 9; i++ {
+		cand.Path = fmt.Sprintf("%s%d", base, i)
+		occupied, err := homeOccupied(ctx, cand)
+		if err == nil && !occupied {
+			return cand.String()
+		}
+	}
+	return cand.String()
+}
+
 // provisionLocal provisions a node that shares the controller's filesystem.
-func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, repos []config.Repo) error {
-	if _, err := os.Stat(filepath.Join(loc.Path, "config.yml")); err == nil {
+func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo) error {
+	if config.IsOccupied(loc.Path) {
 		return fmt.Errorf("config already exists at %s (remove the node first)", loc.Path)
 	}
 	if err := os.MkdirAll(config.ReposDir(loc.Path), 0o755); err != nil {
@@ -131,7 +234,7 @@ func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, bi
 		return fmt.Errorf("copy binary: %w", err)
 	}
 	log.Info("copied binary", "dest", filepath.Join(loc.Path, "kompensator"))
-	if err := os.WriteFile(filepath.Join(loc.Path, "config.yml"), cfgData, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(loc.Path, config.NodeFile), cfgData, 0o644); err != nil {
 		return fmt.Errorf("write node config: %w", err)
 	}
 	log.Info("wrote node config", "home", loc.Path)
@@ -139,22 +242,20 @@ func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, bi
 		return fmt.Errorf("write age identity: %w", err)
 	}
 	log.Info("wrote age identity", "home", loc.Path)
-	for _, r := range repos {
-		dest := filepath.Join(config.ReposDir(loc.Path), r.Name)
-		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
-		if err != nil {
-			return fmt.Errorf("clone repo %q: %w", r.Name, err)
-		}
-		log.Info("repo cloned", "repo", r.Name, "commit", commit)
+	dest := filepath.Join(config.ReposDir(loc.Path), r.Name)
+	commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
+	if err != nil {
+		return fmt.Errorf("clone repo %q: %w", r.Name, err)
 	}
+	log.Info("repo cloned", "repo", r.Name, "commit", commit)
 	return nil
 }
 
 // provisionRemote provisions a node reachable over ssh.
-func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, repos []config.Repo) error {
+func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo) error {
 	reposDir := loc.Path + "/repos"
-	if err := remoteRun(ctx, loc, "test ! -e "+shellQuote(loc.Path+"/config.yml")); err != nil {
-		return fmt.Errorf("config already exists at %s:%s/config.yml (remove the node first)", loc.Host, loc.Path)
+	if err := remoteRun(ctx, loc, "test ! -e "+shellQuote(loc.Path+"/"+config.NodeFile)); err != nil {
+		return fmt.Errorf("config already exists at %s:%s/%s (remove the node first)", loc.Host, loc.Path, config.NodeFile)
 	}
 	if err := remoteRun(ctx, loc, "mkdir -p "+shellQuote(reposDir)); err != nil {
 		return fmt.Errorf("create node home: %w", err)
@@ -169,7 +270,7 @@ func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, b
 	}
 	log.Info("copied binary", "dest", loc.Host+":"+binaryPath)
 
-	if err := remoteWriteFile(ctx, loc, loc.Path+"/config.yml", cfgData); err != nil {
+	if err := remoteWriteFile(ctx, loc, loc.Path+"/"+config.NodeFile, cfgData); err != nil {
 		return fmt.Errorf("write node config: %w", err)
 	}
 	log.Info("wrote node config", "home", loc.Host+":"+loc.Path)
@@ -183,21 +284,19 @@ func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, b
 	}
 	log.Info("wrote age identity", "home", loc.Host+":"+loc.Path)
 
-	for _, r := range repos {
-		dest := reposDir + "/" + r.Name
-		clone := fmt.Sprintf("git clone -b %s %s %s",
-			shellQuote(r.Branch), shellQuote(r.URL), shellQuote(dest))
-		if err := remoteRun(ctx, loc, clone); err != nil {
-			return fmt.Errorf("clone repo %q on node: %w", r.Name, err)
-		}
-		log.Info("repo cloned", "repo", r.Name, "dest", dest)
+	dest := reposDir + "/" + r.Name
+	clone := fmt.Sprintf("git clone -b %s %s %s",
+		shellQuote(r.Branch), shellQuote(r.URL), shellQuote(dest))
+	if err := remoteRun(ctx, loc, clone); err != nil {
+		return fmt.Errorf("clone repo %q on node: %w", r.Name, err)
 	}
+	log.Info("repo cloned", "repo", r.Name, "dest", dest)
 	return nil
 }
 
-// registerNode adds the node to the inventory of a deployment repo the
-// controller follows and commits + pushes the change.
-func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, location, recipient string, envs []string) error {
+// registerNode adds the node to the repo's inventory (commit + push) and rekeys
+// the repo's environments so the new node becomes a recipient of their secrets.
+func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, location, recipient string) error {
 	r, dest, err := syncedRepo(ctx, home, repoName)
 	if err != nil {
 		return err
@@ -206,7 +305,7 @@ func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, l
 	if err != nil {
 		return err
 	}
-	if err := inv.AddNode(name, location, recipient, envs); err != nil {
+	if err := inv.AddNode(name, location, recipient); err != nil {
 		return err
 	}
 	if err := repo.SaveInventory(dest, inv); err != nil {
@@ -215,46 +314,15 @@ func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, l
 	if err := gitsync.CommitPush(ctx, dest, r.Branch, "inventory: add node "+name, "inventory/nodes.yml"); err != nil {
 		return err
 	}
-	log.Info("node registered in inventory", "node", name, "location", location, "envs", envs)
-	return nil
-}
+	log.Info("node registered in inventory", "node", name, "location", location)
 
-// NodeSetEnv joins or leaves an environment for a node (commit + push).
-func NodeSetEnv(ctx context.Context, home, repoName, name, env string, join bool, log *slog.Logger) error {
-	log = logger(log)
-	if name == "" || env == "" {
-		return fmt.Errorf("node add/leave requires a node name and an env")
-	}
-	r, dest, err := syncedRepo(ctx, home, repoName)
+	// The new node must become a recipient of every environment's secrets, or it
+	// cannot decrypt them on reconcile. Rekey each environment to include it.
+	envs, err := repo.ListEnvironments(dest)
 	if err != nil {
 		return err
 	}
-	inv, err := repo.LoadInventory(dest)
-	if err != nil {
-		return err
-	}
-	action := "left"
-	if join {
-		action = "added to"
-		err = inv.JoinEnv(name, env)
-	} else {
-		err = inv.LeaveEnv(name, env)
-	}
-	if err != nil {
-		return err
-	}
-	if err := repo.SaveInventory(dest, inv); err != nil {
-		return err
-	}
-	msg := fmt.Sprintf("inventory: node %s %s env %s", name, action, env)
-	if err := gitsync.CommitPush(ctx, dest, r.Branch, msg, "inventory/nodes.yml"); err != nil {
-		return err
-	}
-	log.Info("inventory updated", "node", name, "action", action, "env", env)
-
-	// A node that just joined must become a recipient of the env's secrets, or
-	// it cannot decrypt them on reconcile. Rekey so the new node is included.
-	if join {
+	for _, env := range envs {
 		if err := rekeyEnv(ctx, log, r, dest, home, env); err != nil {
 			return fmt.Errorf("rekey %s after adding node: %w", env, err)
 		}
@@ -540,7 +608,7 @@ func stackRecipients(home, dest, env, stack string) ([]string, error) {
 			projectNames = append(projectNames, p.Name)
 		}
 	}
-	runningNodes := e.NodesRunningStack(stack, projectNames, inv.NodesForEnv(env))
+	runningNodes := e.NodesRunningStack(stack, projectNames, inv.AllNodeNames())
 	recipients := append([]string{controllerRecipient}, inv.RecipientsForNodes(runningNodes)...)
 	return dedupeStrings(recipients), nil
 }

@@ -9,31 +9,46 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// configHeader is prepended to a generated config.yml.
-const configHeader = "# kompensator node-local config (managed by 'kompensator bootstrap').\n"
+// File names stored in a kompensator home. A home holds exactly one of them and
+// its presence determines the home's role: a controller aggregates many repos
+// and drives the nodes; a node follows a single repo and reconciles itself.
+const (
+	ControllerFile = "controller.yml"
+	NodeFile       = "node.yml"
+)
 
-// Config is the node-local configuration stored under the kompensator home
-// directory (config.yml). It identifies this node and the deployment repos it
-// follows. It never contains secrets.
+const controllerHeader = "# kompensator controller config (managed by 'kompensator controller ...').\n"
+const nodeHeader = "# kompensator node-local config (managed by 'kompensator bootstrap').\n"
+
+// Role identifies what a kompensator home is: a controller or a node.
+type Role int
+
+const (
+	RoleUnknown Role = iota
+	RoleController
+	RoleNode
+)
+
+// Config is the loaded, role-resolved configuration of a kompensator home. It
+// never contains secrets.
 //
-// node.name is optional: a host that only acts as a controller (aggregating
-// the status of all nodes from a checked-out deployment repo) leaves it empty.
-// A reconcile agent, by contrast, requires node.name.
+// A controller home (controller.yml) tracks one or more deployment repos and
+// has no node identity of its own. A node home (node.yml) has a mandatory node
+// name and follows exactly one repo. The two are mutually exclusive: a single
+// home is either a controller or a node, never both.
+//
+// Repos always holds the repos this home acts on: every configured repo for a
+// controller, or the single followed repo (a one-element slice) for a node.
 type Config struct {
-	Node   Node    `yaml:"node"`
-	Naming *Naming `yaml:"naming,omitempty"`
-	Repos  []Repo  `yaml:"repos"`
+	Role     Role
+	NodeName string  // node identity (RoleNode only; empty on a controller)
+	Repos    []Repo  // controller: all repos; node: the single followed repo
+	Naming   *Naming // optional project-naming overrides
 }
 
-// IsController reports whether this config is for a controller-only host, i.e.
-// one that has no node identity of its own and only aggregates node status.
+// IsController reports whether this home is a controller.
 func (c *Config) IsController() bool {
-	return c.Node.Name == ""
-}
-
-// Node identifies this machine within a deployment repo's inventory.
-type Node struct {
-	Name string `yaml:"name"`
+	return c.Role == RoleController
 }
 
 // Naming controls which optional leading segments are used in the generated
@@ -59,11 +74,24 @@ func (n *Naming) UseNode() bool {
 	return n == nil || n.IncludeNode == nil || *n.IncludeNode
 }
 
-// Repo is a deployment repository the node tracks.
+// Repo is a deployment repository a home tracks.
 type Repo struct {
 	Name   string `yaml:"name"`
 	URL    string `yaml:"url"`
 	Branch string `yaml:"branch"`
+}
+
+// controllerFile is the on-disk shape of controller.yml.
+type controllerFile struct {
+	Naming *Naming `yaml:"naming,omitempty"`
+	Repos  []Repo  `yaml:"repos"`
+}
+
+// nodeFile is the on-disk shape of node.yml.
+type nodeFile struct {
+	Node   string  `yaml:"node"`
+	Naming *Naming `yaml:"naming,omitempty"`
+	Repo   Repo    `yaml:"repo"`
 }
 
 // Home returns the kompensator home directory.
@@ -91,63 +119,131 @@ func ReposDir(home string) string {
 	return filepath.Join(home, "repos")
 }
 
-// Load reads and validates config.yml from the given home directory.
+// IsOccupied reports whether home already holds a kompensator config (either
+// role). Used by bootstrap to avoid clobbering an existing home.
+func IsOccupied(home string) bool {
+	for _, name := range []string{ControllerFile, NodeFile} {
+		if _, err := os.Stat(filepath.Join(home, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// Load reads and validates the config of a kompensator home, resolving its
+// role from which config file is present.
 func Load(home string) (*Config, error) {
-	path := filepath.Join(home, "config.yml")
+	ctrlPath := filepath.Join(home, ControllerFile)
+	nodePath := filepath.Join(home, NodeFile)
+
+	_, ctrlErr := os.Stat(ctrlPath)
+	_, nodeErr := os.Stat(nodePath)
+	ctrlOK := ctrlErr == nil
+	nodeOK := nodeErr == nil
+
+	switch {
+	case ctrlOK && nodeOK:
+		return nil, fmt.Errorf("home %s has both %s and %s; a home is either a controller or a node", home, ControllerFile, NodeFile)
+	case ctrlOK:
+		return loadController(ctrlPath)
+	case nodeOK:
+		return loadNode(nodePath)
+	default:
+		return nil, fmt.Errorf("no %s or %s in %s: run 'kompensator controller init' or 'kompensator bootstrap'", ControllerFile, NodeFile, home)
+	}
+}
+
+func loadController(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
-
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	var f controllerFile
+	if err := yaml.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-
-	// node.name is optional (a controller-only host has none). When present, a
-	// reconcile run uses it; Run enforces that it is set.
-	if len(cfg.Repos) == 0 {
-		return nil, fmt.Errorf("config %s: at least one repo is required", path)
-	}
-	for i := range cfg.Repos {
-		r := &cfg.Repos[i]
-		if r.Name == "" || r.URL == "" {
-			return nil, fmt.Errorf("config %s: repo %d needs name and url", path, i)
-		}
-		if r.Branch == "" {
-			r.Branch = "main"
+	for i := range f.Repos {
+		if err := validateRepo(&f.Repos[i], path, i); err != nil {
+			return nil, err
 		}
 	}
-
-	return &cfg, nil
+	return &Config{Role: RoleController, Repos: f.Repos, Naming: f.Naming}, nil
 }
 
-// Marshal renders cfg as the byte content of a config.yml (header + YAML). It
-// is shared by Write (local) and by the controller when provisioning a remote
-// node's config over ssh.
-func Marshal(cfg Config) ([]byte, error) {
+func loadNode(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	var f nodeFile
+	if err := yaml.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if f.Node == "" {
+		return nil, fmt.Errorf("config %s: node name is required", path)
+	}
+	if err := validateRepo(&f.Repo, path, 0); err != nil {
+		return nil, err
+	}
+	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming}, nil
+}
+
+func validateRepo(r *Repo, path string, i int) error {
+	if r.Name == "" || r.URL == "" {
+		return fmt.Errorf("config %s: repo %d needs name and url", path, i)
+	}
+	if r.Branch == "" {
+		r.Branch = "main"
+	}
+	return nil
+}
+
+// MarshalController renders a controller.yml (header + YAML).
+func MarshalController(repos []Repo, naming *Naming) ([]byte, error) {
+	return marshal(controllerHeader, controllerFile{Naming: naming, Repos: repos})
+}
+
+// MarshalNode renders a node.yml (header + YAML). It is shared by bootstrap when
+// provisioning a remote node's config over ssh.
+func MarshalNode(nodeName string, r Repo, naming *Naming) ([]byte, error) {
+	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, Repo: r})
+}
+
+func marshal(header string, v any) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteString(configHeader)
+	buf.WriteString(header)
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
-	if err := enc.Encode(cfg); err != nil {
+	if err := enc.Encode(v); err != nil {
 		return nil, fmt.Errorf("encode config: %w", err)
 	}
 	enc.Close()
 	return buf.Bytes(), nil
 }
 
-// Write creates (or overwrites) config.yml in home from cfg. It is used by
-// bootstrap to materialise a new node's local configuration.
-func Write(home string, cfg Config) error {
-	if err := os.MkdirAll(home, 0o755); err != nil {
-		return fmt.Errorf("create home dir: %w", err)
-	}
-	data, err := Marshal(cfg)
+// WriteController creates (or overwrites) controller.yml in home.
+func WriteController(home string, repos []Repo, naming *Naming) error {
+	data, err := MarshalController(repos, naming)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(home, "config.yml")
+	return writeFile(home, ControllerFile, data)
+}
+
+// WriteNode creates (or overwrites) node.yml in home.
+func WriteNode(home, nodeName string, r Repo, naming *Naming) error {
+	data, err := MarshalNode(nodeName, r, naming)
+	if err != nil {
+		return err
+	}
+	return writeFile(home, NodeFile, data)
+}
+
+func writeFile(home, name string, data []byte) error {
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return fmt.Errorf("create home dir: %w", err)
+	}
+	path := filepath.Join(home, name)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
