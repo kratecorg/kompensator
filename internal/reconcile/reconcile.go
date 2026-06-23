@@ -1003,14 +1003,21 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 			}
 		}
 
-		inv, err := repo.LoadInventory(dest)
-		if err != nil {
-			return out, fmt.Errorf("repo %q: %w", r.Name, err)
-		}
-
-		targets, err := statusTargets(inv, cfg.NodeName)
-		if err != nil {
-			return out, fmt.Errorf("repo %q: %w", r.Name, err)
+		var targets []statusTarget
+		if cfg.IsController() {
+			inv, err := repo.LoadInventory(dest)
+			if err != nil {
+				return out, fmt.Errorf("repo %q: %w", r.Name, err)
+			}
+			targets, err = statusTargets(inv, cfg.NodeName)
+			if err != nil {
+				return out, fmt.Errorf("repo %q: %w", r.Name, err)
+			}
+		} else {
+			if cfg.NodeName == "" {
+				return out, fmt.Errorf("node config has no node name")
+			}
+			targets = []statusTarget{{node: cfg.NodeName}}
 		}
 
 		envs, err := statusEnvs(dest, opts.Env)
