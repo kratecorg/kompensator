@@ -536,6 +536,15 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
 		}
 		vars := repo.MergeVariables(stack.Variables, env.Variables, env.NodeVars(names.Node))
+		// The managed proxy's networks decide which of a service's (possibly
+		// several) network IPs the proxy can actually reach it on. Expanded once
+		// here and threaded into the proxy switch.
+		var proxyNets []string
+		if stack.Proxy != nil {
+			for _, n := range stack.Proxy.Networks {
+				proxyNets = append(proxyNets, expandIdentity(n.Name, names, opts.Env, stackName))
+			}
+		}
 		secretVars, err := loadSecretVars(opts.Home, repoRoot, opts.Env, stackName)
 		if err != nil {
 			return res, fmt.Errorf("stack %q secrets: %w", stackName, err)
@@ -548,7 +557,7 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 				log.Info("project not placed on this node, skipping", "stack", stackName, "project", p.Name, "node", names.Node)
 				continue
 			}
-			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, vars, state[p.Name], &res); err != nil {
+			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, vars, state[p.Name], proxyNets, &res); err != nil {
 				log.Error("project reconcile failed", "stack", stackName, "project", p.Name, "error", err)
 				res.Failed++
 			}
@@ -673,7 +682,7 @@ func writeDeployHash(home, env, stack, project, hash string) error {
 
 // reconcileProject brings one compose project to its desired state, using its
 // Blue/Green or recreate strategy.
-func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, vars map[string]string, desired map[string]repo.ServiceImage, res *Result) error {
+func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot, stack string, p repo.Project, vars map[string]string, desired map[string]repo.ServiceImage, proxyNets []string, res *Result) error {
 	plog := log.With("stack", stack, "project", p.Name, "strategy", p.Strategy)
 
 	if len(desired) == 0 {
@@ -702,16 +711,16 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	}
 
 	if p.BlueGreen() {
-		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, res)
+		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, proxyNets, res)
 	}
-	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, res)
+	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, proxyNets, res)
 }
 
 // recreateProject deploys a project in place (no color). Used for projects that
 // cannot run two colors at once, e.g. a database. A recreate project may still
 // declare proxy bindings; its single (color-less) set of containers is the
 // proxy backend, re-asserted on every reconcile.
-func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, res *Result) error {
+func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, proxyNets []string, res *Result) error {
 	proj := names.Project(opts.Env, stack, project, "")
 
 	running, err := runtime.ProjectImages(ctx, "", proj)
@@ -722,7 +731,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	if imagesInSync && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs))
 		// Re-assert the proxy route (idempotent, repairs a lost dynamic file).
-		if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings); err != nil {
+		if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings, proxyNets); err != nil {
 			return err
 		}
 		res.InSync++
@@ -752,7 +761,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 		return fmt.Errorf("after deploy, running images %s != desired %s", describeImages(got), describeRefs(desiredRefs))
 	}
 	// Point the proxy at the freshly deployed containers (no-op without bindings).
-	if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings); err != nil {
+	if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings, proxyNets); err != nil {
 		return err
 	}
 	if err := writeDeployHash(opts.Home, opts.Env, stack, project, configHash); err != nil {
@@ -767,7 +776,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 // blueGreenProject deploys a project into the idle color, waits for it to
 // become healthy, points the environment's reverse proxy at it (when the
 // project declares one), then stops the previously active color.
-func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, res *Result) error {
+func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, proxyNets []string, res *Result) error {
 	running, err := runningByColor(ctx, "", names, opts.Env, stack, project)
 	if err != nil {
 		return err
@@ -782,7 +791,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	active := colorServing(running, desiredRefs)
 	if active != "" && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs), "color", active)
-		if err := switchProxy(ctx, log, names, opts, stack, project, active, proxyBindings); err != nil {
+		if err := switchProxy(ctx, log, names, opts, stack, project, active, proxyBindings, proxyNets); err != nil {
 			return err
 		}
 		if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, active, running); err != nil {
@@ -827,7 +836,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 
 	// Cut traffic over to the new color before stopping the old one: the proxy
 	// switch is the atomic moment users experience the new version.
-	if err := switchProxy(ctx, log, names, opts, stack, project, target, proxyBindings); err != nil {
+	if err := switchProxy(ctx, log, names, opts, stack, project, target, proxyBindings, proxyNets); err != nil {
 		return err
 	}
 	if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, target, running); err != nil {
@@ -847,7 +856,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 // binding. For each binding it resolves the active color's replica containers
 // and hands them to the Router as concrete backends, so the proxy load-balances
 // across every replica.
-func switchProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, stack, project, color string, bindings []repo.ProxyBinding) error {
+func switchProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, stack, project, color string, bindings []repo.ProxyBinding, proxyNets []string) error {
 	if len(bindings) == 0 {
 		return nil
 	}
@@ -857,7 +866,7 @@ func switchProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opt
 		if err != nil {
 			return fmt.Errorf("proxy %q: %w", binding.Kind, err)
 		}
-		servers, err := runtime.ServiceEndpoints(ctx, "", colorProject, binding.Service)
+		servers, err := runtime.ServiceEndpoints(ctx, "", colorProject, binding.Service, proxyNets...)
 		if err != nil {
 			return fmt.Errorf("resolve %s replicas: %w", binding.Service, err)
 		}

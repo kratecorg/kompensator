@@ -140,7 +140,14 @@ func ProjectImages(ctx context.Context, dockerHost, project string) (map[string]
 // kompensator rewrites the proxy config on every deploy and re-asserts it on
 // every in-sync reconcile, so the IPs never go stale for long. dockerHost is
 // the docker "-H" endpoint ("" = local daemon).
-func ServiceEndpoints(ctx context.Context, dockerHost, project, service string) ([]string, error) {
+//
+// preferNetworks names the networks the requesting proxy is attached to. A
+// service container may join several networks (e.g. an "app" network for the
+// database and an "internal" network shared with the proxy); the proxy can only
+// reach it on a network they share, so when preferNetworks is non-empty the IP
+// on the first matching network is returned. When it is empty, or none match,
+// the first network's IP is used (services historically join a single network).
+func ServiceEndpoints(ctx context.Context, dockerHost, project, service string, preferNetworks ...string) ([]string, error) {
 	out, err := output(ctx, "docker", dockerArgs(dockerHost,
 		"ps",
 		"--filter", "label=com.docker.compose.project="+project,
@@ -161,13 +168,18 @@ func ServiceEndpoints(ctx context.Context, dockerHost, project, service string) 
 	}
 	sort.Strings(names)
 
-	// Resolve each container's IP. The template prints the IP of every network
-	// the container is attached to, space-separated; app services join a single
-	// network (the one shared with the proxy), so the first address is the one
-	// the proxy reaches it on. Containers are inspected in the (sorted) name
-	// order they are passed, keeping the result deterministic.
+	// Resolve each container's IP. The template prints "<network>=<ip>" for
+	// every network the container is attached to, space-separated. A service
+	// may join multiple networks, so pick the IP on a network the proxy shares
+	// (preferNetworks); fall back to the first network when none match.
+	prefer := make(map[string]bool, len(preferNetworks))
+	for _, n := range preferNetworks {
+		if n != "" {
+			prefer[n] = true
+		}
+	}
 	args := append([]string{"inspect",
-		"--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}"},
+		"--format", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}"},
 		names...)
 	out, err = output(ctx, "docker", dockerArgs(dockerHost, args...)...)
 	if err != nil {
@@ -179,12 +191,37 @@ func ServiceEndpoints(ctx context.Context, dockerHost, project, service string) 
 		if len(fields) == 0 {
 			continue
 		}
-		ips = append(ips, fields[0])
+		ip := pickEndpointIP(fields, prefer)
+		if ip == "" {
+			continue
+		}
+		ips = append(ips, ip)
 	}
 	if len(ips) != len(names) {
 		return nil, fmt.Errorf("resolved %d IP(s) for %d container(s) of service %q", len(ips), len(names), service)
 	}
 	return ips, nil
+}
+
+// pickEndpointIP selects a container's reachable IP from "<network>=<ip>"
+// fields. It returns the IP on the first network present in prefer; failing
+// that (or when prefer is empty) the first field's IP, preserving the previous
+// single-network behaviour.
+func pickEndpointIP(fields []string, prefer map[string]bool) string {
+	first := ""
+	for _, f := range fields {
+		name, ip, ok := strings.Cut(f, "=")
+		if !ok || ip == "" {
+			continue
+		}
+		if first == "" {
+			first = ip
+		}
+		if prefer[name] {
+			return ip
+		}
+	}
+	return first
 }
 
 // ProjectContainers lists every container of a compose project (running or
