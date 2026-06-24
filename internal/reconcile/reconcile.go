@@ -689,7 +689,7 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 		}
 	}
 
-	extraEnv, desiredRefs := buildEnv(opts.Env, proxyDir(opts.Home, names.Repo, opts.Env, stack), vars, desired)
+	extraEnv, desiredRefs := buildEnv(names, opts.Env, stack, p.Name, proxyDir(opts.Home, names.Repo, opts.Env, stack), vars, desired)
 	composeFile := repo.ComposeFile(repoRoot, stack, p)
 
 	// The config hash folds the compose file and the effective deploy env
@@ -958,16 +958,35 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 }
 
 // buildEnv assembles the compose env vars for a deploy: the stack/env variables
-// (lowest precedence), the built-in ENV_NAME and PROXY_DIR, and the per-service
-// <SERVICE>_IMAGE / <SERVICE>_TAG values (highest precedence, so user variables
-// can never break image injection). NODE_NAME is added separately by Deploy. It
-// also returns the desired image ref per service.
-func buildEnv(envName, proxyDir string, vars map[string]string, desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
-	merged := make(map[string]string, len(vars)+len(desired)*2+2)
+// (lowest precedence), the built-in identity vars (ENV_NAME, REPO_NAME,
+// STACK_NAME, PROJECT_NAME, STACK_PREFIX, PROJECT_PREFIX, PROXY_DIR) and the
+// per-service <SERVICE>_IMAGE / <SERVICE>_TAG values (highest precedence, so user
+// variables can never break image injection). NODE_NAME is added separately by
+// Deploy, and COLOR by blueGreenProject. STACK_PREFIX is shared by every project
+// of a stack and PROJECT_PREFIX is the color-independent compose project name, so
+// a compose file can name a resource (e.g. a shared network) stably across
+// projects of a stack or across color switches. It also returns the desired
+// image ref per service.
+func buildEnv(names runtime.Names, envName, stack, project, proxyDir string, vars map[string]string, desired map[string]repo.ServiceImage) (extraEnv []string, refs map[string]string) {
+	merged := make(map[string]string, len(vars)+len(desired)*2+8)
 	for k, v := range vars {
 		merged[k] = v
 	}
 	merged["ENV_NAME"] = envName
+	merged["STACK_NAME"] = stack
+	merged["PROJECT_NAME"] = project
+	// STACK_PREFIX is the name prefix shared by every project of this stack
+	// (color-independent and project-independent), so one project can own a
+	// resource (e.g. a network) and another project of the same stack can
+	// reference it by the same stable name.
+	merged["STACK_PREFIX"] = names.StackPrefix(envName, stack)
+	// PROJECT_PREFIX is the deploy's compose project name without the Blue/Green
+	// color suffix: globally unique on the host yet stable across color switches,
+	// so it is the safe handle for naming color-independent resources.
+	merged["PROJECT_PREFIX"] = names.Project(envName, stack, project, "")
+	if names.Repo != "" {
+		merged["REPO_NAME"] = names.Repo
+	}
 	// PROXY_DIR is the node-local directory a file-based reverse proxy watches
 	// for dynamic configuration. The proxy stack bind-mounts it; kompensator
 	// writes color-switch files into it (see internal/proxy).

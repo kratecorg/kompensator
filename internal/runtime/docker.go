@@ -69,6 +69,18 @@ func (n Names) Project(env, stack, project, color string) string {
 	return sanitize(base)
 }
 
+// StackPrefix returns the name prefix shared by every project of a stack:
+//
+//	[<repo>-][<node>-]<env>-<stack>
+//
+// It is identical across all projects of the same stack (and stable across
+// Blue/Green color switches), so it is the handle for naming stack-scoped
+// resources one project owns and another references — e.g. a shared network.
+func (n Names) StackPrefix(env, stack string) string {
+	parts := append(n.leadingSegments(), env, stack)
+	return sanitize(strings.Join(parts, "-"))
+}
+
 // TeardownPrefix returns the project-name prefix that matches every project of
 // this node, or "" when neither repo nor node is part of the name (in which
 // case projects cannot be scoped to a single node).
