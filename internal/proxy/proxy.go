@@ -74,8 +74,11 @@ func (t Target) Validate() error {
 		return fmt.Errorf("proxy target: service is required")
 	case t.Port == 0:
 		return fmt.Errorf("proxy target: port is required")
-	case t.Color == "":
-		return fmt.Errorf("proxy target: color is required")
+	case t.Color == "" && len(t.Servers) == 0:
+		// Color names the fallback backend alias "<Service>-<Color>"; it is only
+		// required when no concrete Servers were resolved. A recreate project has
+		// no color but always supplies its running containers as Servers.
+		return fmt.Errorf("proxy target: color or servers required")
 	case t.DynamicDir == "":
 		return fmt.Errorf("proxy target: dynamic dir is required")
 	}
