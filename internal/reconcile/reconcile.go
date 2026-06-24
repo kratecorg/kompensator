@@ -895,7 +895,11 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 	dynDir := proxyDir(opts.Home, names.Repo, opts.Env, stack)
 	nets := make([]proxy.ManagedNetwork, len(mp.Networks))
 	for i, n := range mp.Networks {
-		nets[i] = proxy.ManagedNetwork{Name: n.Name, Aliases: n.Aliases}
+		aliases := make([]string, len(n.Aliases))
+		for j, a := range n.Aliases {
+			aliases[j] = expandIdentity(a, names, opts.Env, stack)
+		}
+		nets[i] = proxy.ManagedNetwork{Name: expandIdentity(n.Name, names, opts.Env, stack), Aliases: aliases}
 	}
 	composeYAML, err := prov.Compose(proxy.ManagedSpec{
 		Name:       mp.Name,
@@ -955,6 +959,23 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 	plog.Info("deployed")
 	res.Deployed++
 	return nil
+}
+
+// expandIdentity substitutes the stack-scoped built-in variables in a string
+// taken from stack.yml, e.g. a managed proxy's network name or alias. Variables
+// in compose files are expanded by docker compose at deploy time, but stack.yml
+// is parsed by kompensator itself, so kompensator resolves these here. Only the
+// variables known before a concrete project/color exists are available (no
+// PROJECT_PREFIX/COLOR); an unknown variable expands to empty, as in a shell.
+func expandIdentity(s string, names runtime.Names, env, stack string) string {
+	repl := map[string]string{
+		"ENV_NAME":     env,
+		"STACK_NAME":   stack,
+		"STACK_PREFIX": names.StackPrefix(env, stack),
+		"NODE_NAME":    names.Node,
+		"REPO_NAME":    names.Repo,
+	}
+	return os.Expand(s, func(k string) string { return repl[k] })
 }
 
 // buildEnv assembles the compose env vars for a deploy: the stack/env variables
