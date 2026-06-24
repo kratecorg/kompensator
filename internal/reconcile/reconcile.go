@@ -704,12 +704,14 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	if p.BlueGreen() {
 		return blueGreenProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, res)
 	}
-	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, res)
+	return recreateProject(ctx, plog, names, opts, composeFile, stack, p.Name, extraEnv, desiredRefs, configHash, p.Proxy, res)
 }
 
 // recreateProject deploys a project in place (no color). Used for projects that
-// cannot run two colors at once, e.g. a database.
-func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, res *Result) error {
+// cannot run two colors at once, e.g. a database. A recreate project may still
+// declare proxy bindings; its single (color-less) set of containers is the
+// proxy backend, re-asserted on every reconcile.
+func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, composeFile, stack, project string, extraEnv []string, desiredRefs map[string]string, configHash string, proxyBindings []repo.ProxyBinding, res *Result) error {
 	proj := names.Project(opts.Env, stack, project, "")
 
 	running, err := runtime.ProjectImages(ctx, "", proj)
@@ -719,6 +721,10 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	imagesInSync := imagesMatch(running, desiredRefs)
 	if imagesInSync && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs))
+		// Re-assert the proxy route (idempotent, repairs a lost dynamic file).
+		if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings); err != nil {
+			return err
+		}
 		res.InSync++
 		return nil
 	}
@@ -744,6 +750,10 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	}
 	if !imagesMatch(got, desiredRefs) {
 		return fmt.Errorf("after deploy, running images %s != desired %s", describeImages(got), describeRefs(desiredRefs))
+	}
+	// Point the proxy at the freshly deployed containers (no-op without bindings).
+	if err := switchProxy(ctx, log, names, opts, stack, project, "", proxyBindings); err != nil {
+		return err
 	}
 	if err := writeDeployHash(opts.Home, opts.Env, stack, project, configHash); err != nil {
 		return err
@@ -859,7 +869,7 @@ func switchProxy(ctx context.Context, log *slog.Logger, names runtime.Names, opt
 			Service:    binding.Service,
 			Port:       binding.Port,
 			Servers:    servers,
-			Rule:       binding.Rule,
+			Rule:       expandIdentity(binding.Rule, names, opts.Env, stack),
 			Color:      color,
 			EntryPoint: binding.EntryPoint,
 			DynamicDir: proxyDir(opts.Home, names.Repo, opts.Env, stack),
@@ -899,7 +909,7 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 		for j, a := range n.Aliases {
 			aliases[j] = expandIdentity(a, names, opts.Env, stack)
 		}
-		nets[i] = proxy.ManagedNetwork{Name: expandIdentity(n.Name, names, opts.Env, stack), Aliases: aliases}
+		nets[i] = proxy.ManagedNetwork{Name: expandIdentity(n.Name, names, opts.Env, stack), Aliases: aliases, Owned: n.Owned}
 	}
 	composeYAML, err := prov.Compose(proxy.ManagedSpec{
 		Name:       mp.Name,

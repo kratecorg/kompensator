@@ -449,10 +449,17 @@ func (m *ManagedProxy) UnmarshalYAML(value *yaml.Node) error {
 
 // ProxyNetwork is one docker network a managed proxy joins, with optional
 // aliases so another proxy can reach it under a stable name. It decodes from a
-// bare network name (scalar) or a mapping {name, aliases}.
+// bare network name (scalar) or a mapping {name, aliases, owned}.
 type ProxyNetwork struct {
 	Name    string   `yaml:"name"`
 	Aliases []string `yaml:"aliases,omitempty"`
+	// Owned makes the managed proxy CREATE this network (with the exact name
+	// given) instead of joining a pre-existing one. Use it for a network the
+	// proxy is the stable owner of — e.g. an "external" network a user-managed
+	// edge proxy joins to reach this proxy under one of its aliases. The default
+	// (false) joins the network as external; it must already exist (a stack
+	// project owns it).
+	Owned bool `yaml:"owned,omitempty"`
 }
 
 // UnmarshalYAML accepts a scalar network name or a {name, aliases} mapping.

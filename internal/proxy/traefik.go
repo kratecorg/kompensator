@@ -134,7 +134,9 @@ func (traefik) Compose(spec ManagedSpec) ([]byte, error) {
 	for i, n := range spec.Networks {
 		key := fmt.Sprintf("net%d", i)
 		svcNets[key] = traefikComposeSvcNet{Aliases: n.Aliases}
-		topNets[key] = traefikComposeNetwork{External: true, Name: n.Name}
+		// An owned network is created by this compose project (external: false);
+		// the name is still pinned so other projects can join it as external.
+		topNets[key] = traefikComposeNetwork{External: !n.Owned, Name: n.Name}
 	}
 
 	doc := traefikCompose{
