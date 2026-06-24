@@ -44,6 +44,12 @@ type Config struct {
 	NodeName string  // node identity (RoleNode only; empty on a controller)
 	Repos    []Repo  // controller: all repos; node: the single followed repo
 	Naming   *Naming // optional project-naming overrides
+
+	// StatusWriteback enables publishing this node's reconcile status to git
+	// (RoleNode only; default off). The status document is always written
+	// locally; this switch only controls whether it is also pushed to the
+	// node's status branch.
+	StatusWriteback bool
 }
 
 // IsController reports whether this home is a controller.
@@ -89,9 +95,10 @@ type controllerFile struct {
 
 // nodeFile is the on-disk shape of node.yml.
 type nodeFile struct {
-	Node   string  `yaml:"node"`
-	Naming *Naming `yaml:"naming,omitempty"`
-	Repo   Repo    `yaml:"repo"`
+	Node            string  `yaml:"node"`
+	Naming          *Naming `yaml:"naming,omitempty"`
+	StatusWriteback bool    `yaml:"statusWriteback,omitempty"`
+	Repo            Repo    `yaml:"repo"`
 }
 
 // Home returns the kompensator home directory.
@@ -185,7 +192,7 @@ func loadNode(path string) (*Config, error) {
 	if err := validateRepo(&f.Repo, path, 0); err != nil {
 		return nil, err
 	}
-	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming}, nil
+	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming, StatusWriteback: f.StatusWriteback}, nil
 }
 
 func validateRepo(r *Repo, path string, i int) error {
@@ -205,8 +212,8 @@ func MarshalController(repos []Repo, naming *Naming) ([]byte, error) {
 
 // MarshalNode renders a node.yml (header + YAML). It is shared by bootstrap when
 // provisioning a remote node's config over ssh.
-func MarshalNode(nodeName string, r Repo, naming *Naming) ([]byte, error) {
-	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, Repo: r})
+func MarshalNode(nodeName string, r Repo, naming *Naming, statusWriteback bool) ([]byte, error) {
+	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, StatusWriteback: statusWriteback, Repo: r})
 }
 
 func marshal(header string, v any) ([]byte, error) {
@@ -231,8 +238,8 @@ func WriteController(home string, repos []Repo, naming *Naming) error {
 }
 
 // WriteNode creates (or overwrites) node.yml in home.
-func WriteNode(home, nodeName string, r Repo, naming *Naming) error {
-	data, err := MarshalNode(nodeName, r, naming)
+func WriteNode(home, nodeName string, r Repo, naming *Naming, statusWriteback bool) error {
+	data, err := MarshalNode(nodeName, r, naming, statusWriteback)
 	if err != nil {
 		return err
 	}

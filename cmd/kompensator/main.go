@@ -10,10 +10,12 @@ import (
 	"os/signal"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"kompensator/internal/admin"
 	"kompensator/internal/config"
 	"kompensator/internal/reconcile"
+	"kompensator/internal/verify"
 )
 
 // version is overridable at build time with -ldflags "-X main.version=...".
@@ -48,6 +50,8 @@ func main() {
 		os.Exit(cmdReconcile(g, rest))
 	case "status":
 		os.Exit(cmdStatus(g, rest))
+	case "verify":
+		os.Exit(cmdVerify(g, rest))
 	case "controller":
 		os.Exit(cmdController(g, rest))
 	case "bootstrap":
@@ -178,6 +182,105 @@ func resolveHome(home string) (string, error) {
 	return config.Home()
 }
 
+// cmdVerify checks, from git, whether every node that hosts an environment has
+// reconciled a desired commit and reports healthy.
+//
+// On a controller (or node) home it resolves the deployment-repo checkout and
+// participating nodes from the home config, the way reconcile does, and verifies
+// the latest commit on the deploy branch. With --repo-path it instead works off
+// a bare checkout with no home and no ssh access, so a CI pipeline can wait for a
+// deployment to land.
+func cmdVerify(g globals, args []string) int {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	repoPath := fs.String("repo-path", "", "verify against this bare deployment-repo checkout instead of the home config (for CI)")
+	repoName := fs.String("repo", "", "limit to this repo (home mode; default: all configured repos)")
+	commit := fs.String("commit", "", "desired commit to verify (default: the deploy branch's tip)")
+	branch := fs.String("branch", "", "deployed branch the status branches derive from (--repo-path mode; default: the checkout's current branch)")
+	wait := fs.Bool("wait", false, "poll until healthy or --timeout elapses")
+	timeout := fs.Duration("timeout", 5*time.Minute, "overall budget when --wait is set")
+	interval := fs.Duration("interval", 10*time.Second, "delay between polls when --wait is set")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] verify <env> [--repo <name>] [--commit <sha>] [--wait [--timeout <d>] [--interval <d>]]")
+		fmt.Fprintln(os.Stderr, "       kompensator verify <env> --repo-path <dir> [--commit <sha>] [--branch <name>] [--wait ...]   (CI, no home)")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if len(pos) != 1 {
+		fs.Usage()
+		return 2
+	}
+	env := arg(pos, 0)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var res verify.Result
+	switch {
+	case *repoPath != "":
+		// CI mode: a bare checkout, no home.
+		res, err = verify.Run(ctx, verify.Options{
+			RepoPath: *repoPath,
+			Env:      env,
+			Commit:   *commit,
+			Branch:   *branch,
+			Wait:     *wait,
+			Timeout:  *timeout,
+			Interval: *interval,
+			Logger:   newLogger(g.jsonLog),
+		})
+	default:
+		// Home mode: resolve the repo checkout(s) from the controller/node config.
+		h, herr := resolveHome(g.home)
+		if herr != nil || !config.IsOccupied(h) {
+			fmt.Fprintln(os.Stderr, "error: no kompensator home found; run in a controller/node home or pass --repo-path <dir>")
+			return 1
+		}
+		res, err = verify.RunHome(ctx, verify.HomeOptions{
+			Home:     h,
+			Repo:     *repoName,
+			Env:      env,
+			Commit:   *commit,
+			Wait:     *wait,
+			Timeout:  *timeout,
+			Interval: *interval,
+			Logger:   newLogger(g.jsonLog),
+		})
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "NODE\tCOMMIT\tHEALTHY\tSTATUS")
+	for _, n := range res.Nodes {
+		state := "ok"
+		if !n.OK {
+			state = n.Reason
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%t\t%s\n", n.Node, dash(shortSHA(n.DesiredCommit)), n.Healthy, state)
+	}
+	tw.Flush()
+
+	if !res.OK {
+		fmt.Printf("\nenv %q not yet at %s\n", res.Env, shortSHA(res.Commit))
+		return 1
+	}
+	fmt.Printf("\nenv %q healthy at %s\n", res.Env, shortSHA(res.Commit))
+	return 0
+}
+
+// shortSHA truncates a commit for display.
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 // cmdController handles controller-home administration: initialising the home
 // and adding deployment repos to it.
 func cmdController(g globals, args []string) int {
@@ -264,8 +367,9 @@ func cmdBootstrap(g globals, args []string) int {
 	name := fs.String("name", "", "node name in the inventory")
 	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
 	repoName := fs.String("repo", "", "which repo the node follows (default: the sole repo)")
+	statusWriteback := fs.Bool("status-writeback", false, "publish reconcile status to the node's git status branch")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback]")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
@@ -288,11 +392,12 @@ func cmdBootstrap(g globals, args []string) int {
 
 	log := newLogger(g.jsonLog)
 	if err := admin.ProvisionNode(ctx, admin.ProvisionOptions{
-		ControllerHome: h,
-		Name:           *name,
-		Location:       *location,
-		RepoName:       *repoName,
-		Logger:         log,
+		ControllerHome:  h,
+		Name:            *name,
+		Location:        *location,
+		RepoName:        *repoName,
+		StatusWriteback: *statusWriteback,
+		Logger:          log,
 	}); err != nil {
 		log.Error("bootstrap failed", "error", err)
 		return 1

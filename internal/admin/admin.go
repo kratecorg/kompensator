@@ -81,11 +81,12 @@ func ControllerAddRepo(ctx context.Context, home, name, url, branch string, log 
 
 // ProvisionOptions configures provisioning a new node from the controller.
 type ProvisionOptions struct {
-	ControllerHome string // the controller's kompensator home (source of repos)
-	Name           string // node name in the inventory
-	Location       string // ssh://[user@]host[:port][/path] or an absolute local path
-	RepoName       string // which repo the node follows (default: the sole repo)
-	Logger         *slog.Logger
+	ControllerHome  string // the controller's kompensator home (source of repos)
+	Name            string // node name in the inventory
+	Location        string // ssh://[user@]host[:port][/path] or an absolute local path
+	RepoName        string // which repo the node follows (default: the sole repo)
+	StatusWriteback bool   // enable publishing reconcile status to git
+	Logger          *slog.Logger
 }
 
 // ProvisionNode materialises a new node entirely from the controller: it copies
@@ -129,7 +130,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("resolve own binary: %w", err)
 	}
 
-	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming)
+	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming, opts.StatusWriteback)
 	if err != nil {
 		return err
 	}

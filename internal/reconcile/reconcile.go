@@ -175,10 +175,17 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 			Repo: r.Name, Node: cfg.NodeName,
 			IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
 		}
-		res, err := reconcileRepo(ctx, log, names, opts, dest)
+		res, rerr := reconcileRepo(ctx, log, names, opts, dest)
 		total.add(res)
-		if err != nil {
-			return total, fmt.Errorf("reconcile repo %q: %w", r.Name, err)
+
+		// Finalise the environment's status document regardless of outcome, so a
+		// partial failure is recorded as unhealthy for the pipeline to observe.
+		// Publishing to git is gated on the node opting in.
+		if err := finalizeNodeStatus(ctx, log, opts, cfg, r, dest, names, commit, total); err != nil {
+			log.Error("write status failed", "error", err)
+		}
+		if rerr != nil {
+			return total, fmt.Errorf("reconcile repo %q: %w", r.Name, rerr)
 		}
 	}
 
@@ -194,7 +201,162 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 	return total, nil
 }
 
-// runController triggers reconcile on every node that participates in the
+// finalizeNodeStatus records the run-level outcome of a node reconcile into the
+// environment's status document: the reconciled repo commit, a timestamp, the
+// overall health, and a fresh per-service running snapshot. It preserves the
+// per-project config fingerprints written incrementally during the reconcile.
+//
+// Healthy is the deploy signal a pipeline waits on: it is true only when no
+// project failed to reconcile (every project either deployed and became
+// healthy, was already in sync, or had nothing to deploy). The per-service
+// detail is recorded for observability and is not part of that signal.
+//
+// When the node enables status write-back, the saved document is also published
+// to git so a CI pipeline can observe DesiredCommit and Healthy.
+func finalizeNodeStatus(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config, r config.Repo, repoRoot string, names runtime.Names, commit string, res Result) error {
+	d, err := loadStatusDoc(opts.Home, opts.Env)
+	if err != nil {
+		return err
+	}
+	d.Node = cfg.NodeName
+	d.Env = opts.Env
+	d.DesiredCommit = commit
+	d.ReconciledAt = time.Now().UTC().Format(time.RFC3339)
+	d.Healthy = res.Failed == 0
+
+	// Refresh the per-service running snapshot. A best-effort collection: if the
+	// docker query fails we still persist the run-level fields (commit, health)
+	// rather than lose the whole document.
+	rows, err := statusEnv(ctx, repoRoot, names, statusTarget{node: cfg.NodeName}, opts.Env)
+	if err != nil {
+		log.Warn("collect status snapshot failed, recording run-level fields only", "error", err)
+	} else {
+		byProject := map[string]map[string][]ServiceStatus{}
+		for _, r := range rows {
+			key := deployKey(r.Stack, r.Project)
+			if byProject[key] == nil {
+				byProject[key] = map[string][]ServiceStatus{}
+			}
+			byProject[key][r.Service] = append(byProject[key][r.Service], r)
+		}
+		for key, svcs := range byProject {
+			p := d.project(key)
+			p.Services = make(map[string]serviceState, len(svcs))
+			for svc, srows := range svcs {
+				p.Services[svc] = summarizeService(srows)
+			}
+		}
+	}
+
+	if err := d.save(opts.Home, opts.Env); err != nil {
+		return err
+	}
+	log.Info("status written", "env", opts.Env, "commit", commit, "healthy", d.Healthy)
+
+	if cfg.StatusWriteback {
+		if err := publishStatus(ctx, log, opts, cfg, r); err != nil {
+			return fmt.Errorf("publish status: %w", err)
+		}
+	}
+	return nil
+}
+
+// summarizeService folds the per-container status rows of a single service into
+// one observed state: the serving color when in sync, otherwise whatever is
+// running, otherwise the desired tag with InSync false.
+func summarizeService(rows []ServiceStatus) serviceState {
+	for _, r := range rows {
+		if r.State() == "in-sync" {
+			return serviceState{Tag: refTag(r.Desired), Color: r.Color, Health: r.Health, InSync: true}
+		}
+	}
+	for _, r := range rows {
+		if r.Running != "" {
+			return serviceState{Tag: refTag(r.Running), Color: r.Color, Health: r.Health, InSync: false}
+		}
+	}
+	st := serviceState{InSync: false}
+	for _, r := range rows {
+		if r.Desired != "" {
+			st.Tag = refTag(r.Desired)
+		}
+	}
+	return st
+}
+
+// refTag returns the tag portion of an "image:tag" reference, or the whole
+// string when it carries no tag.
+func refTag(ref string) string {
+	if i := strings.LastIndex(ref, ":"); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
+}
+
+// statusKeepCommits bounds the node's status branch to a small rolling window of
+// recent reconciles: enough to debug the last few runs, never growing without
+// bound.
+const statusKeepCommits = 10
+
+// statusBranch is the git branch a node publishes its status to. It derives
+// from the deployed branch so a repo can carry several deploy lines, each with
+// its own per-node status, e.g. "kompensator-status/customer03". A "-status"
+// suffix (rather than nesting under the branch name) is required: git stores
+// refs as files, so "kompensator/status/customer03" would collide with the
+// existing "kompensator" ref (directory/file conflict).
+func statusBranch(deployBranch, node string) string {
+	if deployBranch == "" {
+		deployBranch = "main"
+	}
+	return deployBranch + "-status/" + node
+}
+
+// gatherStatusFiles reads the node's local status documents, returning them
+// keyed by their path on the status branch ("status/<env>.yml"). Publishing the
+// whole set keeps the branch a faithful mirror of the node's local status, so
+// one env's publish never drops another's.
+func gatherStatusFiles(home string) (map[string][]byte, error) {
+	dir := statusDir(home)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]byte{}, nil
+		}
+		return nil, err
+	}
+	files := map[string][]byte{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yml") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		files["status/"+e.Name()] = data
+	}
+	return files, nil
+}
+
+// publishStatus pushes the node's local status documents to its status branch.
+// It is a no-op for content that has not changed since the last publish.
+func publishStatus(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config, r config.Repo) error {
+	files, err := gatherStatusFiles(opts.Home)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	branch := statusBranch(r.Branch, cfg.NodeName)
+	gitDir := filepath.Join(opts.Home, "status-git", r.Name)
+	if err := gitsync.PublishStatusBranch(ctx, gitDir, r.URL, branch, files, statusKeepCommits); err != nil {
+		return err
+	}
+	log.Info("status published", "branch", branch)
+	return nil
+}
+
 // environment. Nodes are processed one at a time so a Blue/Green rollout never
 // runs on two nodes simultaneously. A failure on one node is recorded and the
 // rest still run. The home lock is already held by Run.
@@ -459,11 +621,6 @@ func computeConfigHash(composeFile string, extraEnv []string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
-// deployStateDir is where the per-project config fingerprints live on a node.
-func deployStateDir(home string) string {
-	return filepath.Join(home, "deploy-state")
-}
-
 // proxyDir is the node-local directory a file-based reverse proxy watches for
 // dynamic configuration, scoped per deployment-repo, environment and stack.
 // kompensator writes Blue/Green color-switch files here, exposes it to compose
@@ -476,24 +633,42 @@ func proxyDir(home, repo, env, stack string) string {
 	return filepath.Join(home, "proxy", repo, env, stack)
 }
 
+// deployKey identifies a project's fingerprint within an environment's status
+// document. It is color-independent so a Blue/Green project keeps one entry
+// across color switches.
+func deployKey(stack, project string) string {
+	return stack + "/" + project
+}
+
 // readDeployHash returns the last deployed config fingerprint for a project, or
 // "" when none was recorded yet (treated as drift so the next reconcile
-// re-establishes the baseline).
-func readDeployHash(home, project string) string {
-	data, err := os.ReadFile(filepath.Join(deployStateDir(home), project))
+// re-establishes the baseline). The fingerprint lives in the environment's
+// status document.
+func readDeployHash(home, env, stack, project string) string {
+	d, err := loadStatusDoc(home, env)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	if p := d.Projects[deployKey(stack, project)]; p != nil {
+		return p.ConfigHash
+	}
+	return ""
 }
 
-// writeDeployHash records the config fingerprint of the deploy just performed.
-func writeDeployHash(home, project, hash string) error {
-	dir := deployStateDir(home)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// writeDeployHash records the config fingerprint of the deploy just performed,
+// updating only that project's entry in the environment's status document and
+// leaving every other field (and other projects) untouched, so a partial
+// reconcile still persists the progress it made.
+func writeDeployHash(home, env, stack, project, hash string) error {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, project), []byte(hash+"\n"), 0o644)
+	if d.Env == "" {
+		d.Env = env
+	}
+	d.project(deployKey(stack, project)).ConfigHash = hash
+	return d.save(home, env)
 }
 
 // reconcileProject brings one compose project to its desired state, using its
@@ -542,7 +717,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 		return err
 	}
 	imagesInSync := imagesMatch(running, desiredRefs)
-	if imagesInSync && readDeployHash(opts.Home, proj) == configHash && !opts.Force {
+	if imagesInSync && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs))
 		res.InSync++
 		return nil
@@ -570,7 +745,7 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	if !imagesMatch(got, desiredRefs) {
 		return fmt.Errorf("after deploy, running images %s != desired %s", describeImages(got), describeRefs(desiredRefs))
 	}
-	if err := writeDeployHash(opts.Home, proj, configHash); err != nil {
+	if err := writeDeployHash(opts.Home, opts.Env, stack, project, configHash); err != nil {
 		return err
 	}
 
@@ -588,16 +763,14 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 		return err
 	}
 
-	// The hash is tracked per project, independent of the active color, so a
-	// config change forces a switch to the idle color just like an image change.
-	hashKey := names.Project(opts.Env, stack, project, "")
-
 	// A color that fully serves the desired images AND matches the deployed
 	// config means we are in sync; re-assert the proxy route (idempotent, and
 	// repairs a lost dynamic file) and stop any stale other color left behind by
-	// a prior switch. --force overrides.
+	// a prior switch. The fingerprint is tracked per project, independent of the
+	// active color, so a config change forces a switch to the idle color just
+	// like an image change. --force overrides.
 	active := colorServing(running, desiredRefs)
-	if active != "" && readDeployHash(opts.Home, hashKey) == configHash && !opts.Force {
+	if active != "" && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		log.Info("in sync", "images", describeRefs(desiredRefs), "color", active)
 		if err := switchProxy(ctx, log, names, opts, stack, project, active, proxyBindings); err != nil {
 			return err
@@ -650,7 +823,7 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	if err := stopOtherColors(ctx, log, names, opts.Env, stack, project, target, running); err != nil {
 		return err
 	}
-	if err := writeDeployHash(opts.Home, hashKey, configHash); err != nil {
+	if err := writeDeployHash(opts.Home, opts.Env, stack, project, configHash); err != nil {
 		return err
 	}
 
@@ -755,7 +928,7 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 	if err != nil {
 		return err
 	}
-	if len(running) > 0 && readDeployHash(opts.Home, proj) == configHash && !opts.Force {
+	if len(running) > 0 && readDeployHash(opts.Home, opts.Env, stack, project) == configHash && !opts.Force {
 		plog.Info("in sync")
 		res.InSync++
 		return nil
@@ -776,7 +949,7 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 	if err := runtime.WaitHealthy(ctx, proj, healthTimeout); err != nil {
 		return fmt.Errorf("managed proxy not healthy: %w", err)
 	}
-	if err := writeDeployHash(opts.Home, proj, configHash); err != nil {
+	if err := writeDeployHash(opts.Home, opts.Env, stack, project, configHash); err != nil {
 		return err
 	}
 	plog.Info("deployed")
