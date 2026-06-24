@@ -535,7 +535,7 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		if err != nil {
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
 		}
-		vars := repo.MergeVariables(stack.Variables, env.Variables)
+		vars := repo.MergeVariables(stack.Variables, env.Variables, env.NodeVars(names.Node))
 		secretVars, err := loadSecretVars(opts.Home, repoRoot, opts.Env, stackName)
 		if err != nil {
 			return res, fmt.Errorf("stack %q secrets: %w", stackName, err)

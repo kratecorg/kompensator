@@ -192,6 +192,18 @@ type Environment struct {
 	// The kompensator built-ins (NODE_NAME, ENV_NAME, <SERVICE>_IMAGE/_TAG)
 	// always win and cannot be shadowed here.
 	Variables map[string]string `yaml:"variables"`
+	// NodeVariables are per-node overrides keyed by node name. They are layered
+	// on top of Variables for the node currently reconciling, letting a single
+	// node diverge (e.g. a node that hosts a service reaches it in-network while
+	// the others reach it across the WireGuard mesh). Only the entry for the
+	// reconciling node applies; the built-ins still win over everything.
+	NodeVariables map[string]map[string]string `yaml:"nodeVariables,omitempty"`
+}
+
+// NodeVars returns the per-node variable overrides for the named node, or nil
+// if the environment defines none for it.
+func (e Environment) NodeVars(node string) map[string]string {
+	return e.NodeVariables[node]
 }
 
 // StackPlacement is one stack listed in an environment, optionally pinned to a
@@ -522,15 +534,15 @@ func (p Project) BlueGreen() bool {
 }
 
 // MergeVariables returns the effective variables for a stack in an environment:
-// the stack's own defaults overlaid with the environment's overrides. Neither
-// input is mutated; the result is always non-nil.
-func MergeVariables(stack, env map[string]string) map[string]string {
-	merged := make(map[string]string, len(stack)+len(env))
-	for k, v := range stack {
-		merged[k] = v
-	}
-	for k, v := range env {
-		merged[k] = v
+// each layer overlays the previous one, so later arguments win. Typical order
+// is stack defaults, environment variables, then per-node overrides. No input
+// is mutated; the result is always non-nil.
+func MergeVariables(layers ...map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for _, layer := range layers {
+		for k, v := range layer {
+			merged[k] = v
+		}
 	}
 	return merged
 }
