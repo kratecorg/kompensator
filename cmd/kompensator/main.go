@@ -13,13 +13,17 @@ import (
 	"time"
 
 	"kompensator/internal/admin"
+	"kompensator/internal/check"
 	"kompensator/internal/config"
 	"kompensator/internal/reconcile"
 	"kompensator/internal/verify"
+	"kompensator/internal/version"
 )
 
-// version is overridable at build time with -ldflags "-X main.version=...".
-var version = "dev"
+// buildVersion is the release tag, injected at build time with
+// -ldflags "-X main.buildVersion=<tag>". Empty in plain dev builds, where the
+// version is instead derived from the embedded VCS build info.
+var buildVersion = ""
 
 // globals holds flags shared by all subcommands. They must be given before the
 // subcommand, e.g.  kompensator -json -home /path reconcile dev
@@ -52,6 +56,8 @@ func main() {
 		os.Exit(cmdStatus(g, rest))
 	case "verify":
 		os.Exit(cmdVerify(g, rest))
+	case "check":
+		os.Exit(cmdCheck(g, rest))
 	case "controller":
 		os.Exit(cmdController(g, rest))
 	case "bootstrap":
@@ -61,7 +67,7 @@ func main() {
 	case "secrets":
 		os.Exit(cmdSecrets(g, rest))
 	case "version":
-		fmt.Println("kompensator", version)
+		fmt.Println("kompensator", version.Current(buildVersion).Token())
 	case "help":
 		usage()
 	default:
@@ -281,6 +287,66 @@ func shortSHA(sha string) string {
 	return sha
 }
 
+// cmdCheck audits a bootstrap. On a node home it runs the node-local checks
+// (config, binary, age key, repo checkout, reconcile cron). On a controller
+// home it audits every inventory node, re-executing the agent over ssh.
+func cmdCheck(g globals, args []string) int {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	var update bool
+	var controllerVersion string
+	fs.BoolVar(&update, "update", false, "controller: push this binary onto any node older than the controller")
+	fs.StringVar(&controllerVersion, "controller-version", "", "internal: controller version token for node-side comparison")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] check [--update]")
+		fmt.Fprintln(os.Stderr, "  On a node: checks the local bootstrap. On a controller: checks every node.")
+		fs.PrintDefaults()
+	}
+	if _, err := parseFlagsAndArgs(fs, args); err != nil {
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	cfg, err := config.Load(h)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	self := version.Current(buildVersion)
+
+	if cfg.IsController() {
+		ok, err := check.Controller(ctx, h, os.Stdout, self, update)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		if !ok {
+			fmt.Println("\nsome checks failed")
+			return 1
+		}
+		fmt.Println("\nall nodes pass")
+		return 0
+	}
+
+	ref := version.Info{}
+	if controllerVersion != "" {
+		ref = version.Parse(controllerVersion)
+	}
+	results := check.Node(ctx, h, self, ref)
+	check.Render(os.Stdout, results)
+	if !check.AllOK(results) {
+		return 1
+	}
+	return 0
+}
+
 // cmdController handles controller-home administration: initialising the home
 // and adding deployment repos to it.
 func cmdController(g globals, args []string) int {
@@ -368,8 +434,9 @@ func cmdBootstrap(g globals, args []string) int {
 	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
 	repoName := fs.String("repo", "", "which repo the node follows (default: the sole repo)")
 	statusWriteback := fs.Bool("status-writeback", false, "publish reconcile status to the node's git status branch")
+	schedule := fs.String("schedule", config.DefaultSchedule, "cron schedule for the node's self-reconcile")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback] [--schedule <cron>]")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
@@ -397,6 +464,7 @@ func cmdBootstrap(g globals, args []string) int {
 		Location:        *location,
 		RepoName:        *repoName,
 		StatusWriteback: *statusWriteback,
+		Schedule:        *schedule,
 		Logger:          log,
 	}); err != nil {
 		log.Error("bootstrap failed", "error", err)
@@ -676,6 +744,14 @@ Commands:
                     --repo <name>   limit to one repo (default: all)
   status [env]      Show target vs. running images; no env shows all
                     environments. --repo <name> limits to one repo
+  verify <env>      Check, from git, that every node hosting the env has
+                    reconciled the desired commit and is healthy
+                    --commit <sha>  desired commit (default: deploy branch tip)
+                    --wait          poll until healthy or --timeout
+                    --repo-path <d> verify a bare checkout (CI, no home)
+  check             Audit a bootstrap: on a node checks its config, binary,
+                    age key, repo checkout and reconcile cron; on a controller
+                    audits every node over ssh
   controller init   Initialise a controller home (writes controller.yml)
   controller repo add <name> <url> [--branch <b>]
                     Add a deployment repo to the controller and clone it
@@ -683,6 +759,7 @@ Commands:
                     write its node.yml (following one repo), clone that repo on
                     it and register it in the repo's inventory
                     --name <node> --location <loc> [--repo <name>]
+                    [--status-writeback] [--schedule <cron>]
   node rm <name>    Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
                     --repo <name>   which repo's inventory (default: the sole one)

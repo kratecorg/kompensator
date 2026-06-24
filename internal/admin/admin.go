@@ -20,6 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"kompensator/internal/config"
+	"kompensator/internal/cron"
 	"kompensator/internal/gitsync"
 	"kompensator/internal/repo"
 	"kompensator/internal/runtime"
@@ -86,6 +87,7 @@ type ProvisionOptions struct {
 	Location        string // ssh://[user@]host[:port][/path] or an absolute local path
 	RepoName        string // which repo the node follows (default: the sole repo)
 	StatusWriteback bool   // enable publishing reconcile status to git
+	Schedule        string // cron expression for the node's self-reconcile (default: config.DefaultSchedule)
 	Logger          *slog.Logger
 }
 
@@ -117,6 +119,11 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return err
 	}
 
+	schedule := opts.Schedule
+	if schedule == "" {
+		schedule = config.DefaultSchedule
+	}
+
 	loc, err := resolveNodeLocation(ctx, opts.Location)
 	if err != nil {
 		return err
@@ -130,7 +137,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("resolve own binary: %w", err)
 	}
 
-	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming, opts.StatusWriteback)
+	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming, opts.StatusWriteback, schedule)
 	if err != nil {
 		return err
 	}
@@ -143,9 +150,9 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 	}
 
 	if loc.Local {
-		err = provisionLocal(ctx, log, loc, self, cfgData, privateKey, r)
+		err = provisionLocal(ctx, log, loc, self, cfgData, privateKey, r, schedule)
 	} else {
-		err = provisionRemote(ctx, log, loc, self, cfgData, privateKey, r)
+		err = provisionRemote(ctx, log, loc, self, cfgData, privateKey, r, schedule)
 	}
 	if err != nil {
 		return err
@@ -224,7 +231,7 @@ func suggestFreeHome(ctx context.Context, loc repo.Location) string {
 }
 
 // provisionLocal provisions a node that shares the controller's filesystem.
-func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo) error {
+func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo, schedule string) error {
 	if config.IsOccupied(loc.Path) {
 		return fmt.Errorf("config already exists at %s (remove the node first)", loc.Path)
 	}
@@ -249,11 +256,15 @@ func provisionLocal(ctx context.Context, log *slog.Logger, loc repo.Location, bi
 		return fmt.Errorf("clone repo %q: %w", r.Name, err)
 	}
 	log.Info("repo cloned", "repo", r.Name, "commit", commit)
+	if err := cron.InstallLocal(ctx, loc.Path, filepath.Join(loc.Path, "kompensator"), schedule); err != nil {
+		return fmt.Errorf("install reconcile cron: %w", err)
+	}
+	log.Info("reconcile cron installed", "home", loc.Path, "schedule", schedule)
 	return nil
 }
 
 // provisionRemote provisions a node reachable over ssh.
-func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo) error {
+func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, binary string, cfgData []byte, privateKey string, r config.Repo, schedule string) error {
 	reposDir := loc.Path + "/repos"
 	if err := remoteRun(ctx, loc, "test ! -e "+shellQuote(loc.Path+"/"+config.NodeFile)); err != nil {
 		return fmt.Errorf("config already exists at %s:%s/%s (remove the node first)", loc.Host, loc.Path, config.NodeFile)
@@ -292,6 +303,10 @@ func provisionRemote(ctx context.Context, log *slog.Logger, loc repo.Location, b
 		return fmt.Errorf("clone repo %q on node: %w", r.Name, err)
 	}
 	log.Info("repo cloned", "repo", r.Name, "dest", dest)
+	if err := remoteRun(ctx, loc, cron.InstallScript(loc.Path, loc.Path+"/kompensator", schedule)); err != nil {
+		return fmt.Errorf("install reconcile cron on node: %w", err)
+	}
+	log.Info("reconcile cron installed", "home", loc.Host+":"+loc.Path, "schedule", schedule)
 	return nil
 }
 
@@ -369,6 +384,22 @@ func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers
 		if loc, err = repo.ParseLocation(removed.Location); err != nil {
 			log.Warn("cannot parse node location, skipping container/home teardown", "location", removed.Location, "error", err)
 			return nil
+		}
+	}
+
+	// Stop the node self-reconciling: drop its crontab entry. Best-effort, since
+	// the node may be unreachable.
+	if removed.Location != "" {
+		var cronErr error
+		if loc.Local {
+			cronErr = cron.RemoveLocal(ctx, loc.Path)
+		} else {
+			cronErr = remoteRun(ctx, loc, cron.RemoveScript(loc.Path))
+		}
+		if cronErr != nil {
+			log.Warn("could not remove reconcile cron on node", "error", cronErr)
+		} else {
+			log.Info("reconcile cron removed", "node", name)
 		}
 	}
 

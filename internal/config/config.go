@@ -20,6 +20,10 @@ const (
 const controllerHeader = "# kompensator controller config (managed by 'kompensator controller ...').\n"
 const nodeHeader = "# kompensator node-local config (managed by 'kompensator bootstrap').\n"
 
+// DefaultSchedule is the cron expression a node reconciles on when its config
+// leaves the schedule unset: once a minute.
+const DefaultSchedule = "* * * * *"
+
 // Role identifies what a kompensator home is: a controller or a node.
 type Role int
 
@@ -50,6 +54,11 @@ type Config struct {
 	// locally; this switch only controls whether it is also pushed to the
 	// node's status branch.
 	StatusWriteback bool
+
+	// Schedule is the cron expression a node reconciles itself on (RoleNode
+	// only). It is recorded so the cron entry installed at bootstrap, and the
+	// 'check' command, share one source of truth. Empty means DefaultSchedule.
+	Schedule string
 }
 
 // IsController reports whether this home is a controller.
@@ -98,6 +107,7 @@ type nodeFile struct {
 	Node            string  `yaml:"node"`
 	Naming          *Naming `yaml:"naming,omitempty"`
 	StatusWriteback bool    `yaml:"statusWriteback,omitempty"`
+	Schedule        string  `yaml:"schedule,omitempty"`
 	Repo            Repo    `yaml:"repo"`
 }
 
@@ -192,7 +202,11 @@ func loadNode(path string) (*Config, error) {
 	if err := validateRepo(&f.Repo, path, 0); err != nil {
 		return nil, err
 	}
-	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming, StatusWriteback: f.StatusWriteback}, nil
+	schedule := f.Schedule
+	if schedule == "" {
+		schedule = DefaultSchedule
+	}
+	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming, StatusWriteback: f.StatusWriteback, Schedule: schedule}, nil
 }
 
 func validateRepo(r *Repo, path string, i int) error {
@@ -212,8 +226,8 @@ func MarshalController(repos []Repo, naming *Naming) ([]byte, error) {
 
 // MarshalNode renders a node.yml (header + YAML). It is shared by bootstrap when
 // provisioning a remote node's config over ssh.
-func MarshalNode(nodeName string, r Repo, naming *Naming, statusWriteback bool) ([]byte, error) {
-	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, StatusWriteback: statusWriteback, Repo: r})
+func MarshalNode(nodeName string, r Repo, naming *Naming, statusWriteback bool, schedule string) ([]byte, error) {
+	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, StatusWriteback: statusWriteback, Schedule: schedule, Repo: r})
 }
 
 func marshal(header string, v any) ([]byte, error) {
@@ -238,8 +252,8 @@ func WriteController(home string, repos []Repo, naming *Naming) error {
 }
 
 // WriteNode creates (or overwrites) node.yml in home.
-func WriteNode(home, nodeName string, r Repo, naming *Naming, statusWriteback bool) error {
-	data, err := MarshalNode(nodeName, r, naming, statusWriteback)
+func WriteNode(home, nodeName string, r Repo, naming *Naming, statusWriteback bool, schedule string) error {
+	data, err := MarshalNode(nodeName, r, naming, statusWriteback, schedule)
 	if err != nil {
 		return err
 	}
