@@ -120,13 +120,12 @@ type ManagedSpec struct {
 	Publish []string
 }
 
-// ManagedNetwork is one docker network a managed proxy attaches to. By default
-// it is joined as external (it must already exist); when Owned is set the proxy
-// creates the network itself with the exact name given.
+// ManagedNetwork is one docker network a managed proxy attaches to. It is always
+// joined as external: the network must already exist, created by kompensator's
+// resource phase (a stack/env Network) before the proxy deploys.
 type ManagedNetwork struct {
 	Name    string
 	Aliases []string
-	Owned   bool
 }
 
 // Provisioner is implemented by a proxy kind kompensator can run on a stack's

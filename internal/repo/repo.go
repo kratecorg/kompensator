@@ -186,6 +186,12 @@ func (inv *Inventory) RemoveNode(name string) (Node, error) {
 type Environment struct {
 	Name   string           `yaml:"name"`
 	Stacks []StackPlacement `yaml:"stacks"`
+	// Networks and Volumes are docker resources kompensator creates (idempotently)
+	// before deploying any stack of this environment. Use them for resources that
+	// span stacks; per-stack resources belong on the stack instead. Names may
+	// contain the env-scoped built-ins (${ENV_NAME}, ${NODE_NAME}, ${REPO_NAME}).
+	Networks []ManagedResource `yaml:"networks,omitempty"`
+	Volumes  []ManagedResource `yaml:"volumes,omitempty"`
 	// Variables are environment-specific values injected into every compose
 	// project of this environment. They override a stack's own defaults and let
 	// e.g. dev and prod use different settings (replica counts, feature flags).
@@ -383,6 +389,14 @@ func (e Environment) RunsOnNode(node string) bool {
 type Stack struct {
 	Name     string    `yaml:"name"`
 	Projects []Project `yaml:"projects"`
+	// Networks and Volumes are docker resources kompensator creates (idempotently)
+	// before deploying any of the stack's projects, so no project has to "own" a
+	// shared network/volume via compose: every project simply joins them as
+	// external. This removes the deploy-ordering coupling between an owner project
+	// and the projects that reference it. Names may contain the stack-scoped
+	// built-ins (e.g. ${STACK_PREFIX}); they are resolved by kompensator.
+	Networks []ManagedResource `yaml:"networks,omitempty"`
+	Volumes  []ManagedResource `yaml:"volumes,omitempty"`
 	// Proxy, when set, makes kompensator run a stack-internal reverse proxy for
 	// this stack — there is no hand-written compose file for it. It is the
 	// default target of the stack's project proxy bindings (see ManagedProxy).
@@ -390,6 +404,33 @@ type Stack struct {
 	// Variables are the stack's own default values for the variables its compose
 	// files reference. An environment may override any of them.
 	Variables map[string]string `yaml:"variables"`
+}
+
+// ManagedResource is a docker network or volume kompensator creates before any
+// project of the stack/environment deploys, so projects never own a shared
+// resource via compose — they all reference it as external. It decodes from a
+// bare name (scalar) or a mapping {name, driver, options}. The name may contain
+// the identity built-ins (${STACK_PREFIX}, ${ENV_NAME}, ${NODE_NAME}, ...),
+// resolved by kompensator before the resource is created.
+type ManagedResource struct {
+	Name    string            `yaml:"name"`
+	Driver  string            `yaml:"driver,omitempty"`
+	Options map[string]string `yaml:"options,omitempty"`
+}
+
+// UnmarshalYAML accepts a scalar resource name or a {name, driver, options}
+// mapping.
+func (r *ManagedResource) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&r.Name)
+	}
+	type raw ManagedResource
+	var rr raw
+	if err := value.Decode(&rr); err != nil {
+		return err
+	}
+	*r = ManagedResource(rr)
+	return nil
 }
 
 // defaultProxyName is the logical name of a stack's managed proxy when the
@@ -422,8 +463,9 @@ type ManagedProxy struct {
 	// must be a kind kompensator can provision.
 	Kind string `yaml:"kind"`
 	// Networks are the docker networks the proxy joins to reach the services it
-	// routes. They must already exist (a stack project owns them); names may
-	// reference ${ENV_NAME}. Defaults to the stack's conventional network
+	// routes. They must already exist — declare them as stack (or env) Networks so
+	// kompensator creates them before any project deploys. Names may reference
+	// ${STACK_PREFIX}/${ENV_NAME}. Defaults to the stack's conventional network
 	// "<stack>-${ENV_NAME}".
 	Networks []ProxyNetwork `yaml:"networks,omitempty"`
 	// Publish maps host ports onto the proxy, e.g. "8080:80". Empty means the
@@ -448,18 +490,13 @@ func (m *ManagedProxy) UnmarshalYAML(value *yaml.Node) error {
 }
 
 // ProxyNetwork is one docker network a managed proxy joins, with optional
-// aliases so another proxy can reach it under a stable name. It decodes from a
-// bare network name (scalar) or a mapping {name, aliases, owned}.
+// aliases so another proxy can reach it under a stable name. The network must
+// already exist — declare it as a stack/env Network so kompensator creates it
+// before any project deploys. It decodes from a bare network name (scalar) or a
+// mapping {name, aliases}.
 type ProxyNetwork struct {
 	Name    string   `yaml:"name"`
 	Aliases []string `yaml:"aliases,omitempty"`
-	// Owned makes the managed proxy CREATE this network (with the exact name
-	// given) instead of joining a pre-existing one. Use it for a network the
-	// proxy is the stable owner of — e.g. an "external" network a user-managed
-	// edge proxy joins to reach this proxy under one of its aliases. The default
-	// (false) joins the network as external; it must already exist (a stack
-	// project owns it).
-	Owned bool `yaml:"owned,omitempty"`
 }
 
 // UnmarshalYAML accepts a scalar network name or a {name, aliases} mapping.

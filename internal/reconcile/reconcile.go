@@ -510,6 +510,12 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		return res, nil
 	}
 
+	// Phase 0: create the environment's shared networks/volumes before any stack
+	// deploys, so no project has to own a cross-stack resource.
+	if err := ensureResources(ctx, log, names, opts.Env, "", env.Networks, env.Volumes); err != nil {
+		return res, fmt.Errorf("env %q resources: %w", opts.Env, err)
+	}
+
 	for _, placement := range env.Stacks {
 		stackName := placement.Name
 		if !placement.StackRunsOn(names.Node) {
@@ -530,6 +536,12 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		}
 		if err := validateProxyBindings(stack); err != nil {
 			return res, err
+		}
+		// Phase 0 (per stack): create the stack's networks/volumes before any of
+		// its projects — or its managed proxy — deploy, so projects only ever join
+		// them as external and deploy order no longer encodes who owns a network.
+		if err := ensureResources(ctx, log, names, opts.Env, stackName, stack.Networks, stack.Volumes); err != nil {
+			return res, fmt.Errorf("stack %q resources: %w", stackName, err)
 		}
 		state, err := repo.LoadStackState(repoRoot, opts.Env, stackName)
 		if err != nil {
@@ -573,6 +585,43 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		}
 	}
 	return res, nil
+}
+
+// ensureResources creates the docker networks and volumes declared on a stack
+// or environment before its projects deploy (Phase 0). Resource names carry the
+// identity built-ins (${STACK_PREFIX} etc.), resolved here. Creation is
+// idempotent; an already-existing resource is left untouched and nothing is
+// ever deleted (a removed declaration just stops being asserted — a stray
+// network/volume is harmless and a volume may hold data). For an env-level
+// resource stack is "".
+func ensureResources(ctx context.Context, log *slog.Logger, names runtime.Names, env, stack string, networks, volumes []repo.ManagedResource) error {
+	for _, n := range networks {
+		name := expandIdentity(n.Name, names, env, stack)
+		if name == "" {
+			continue
+		}
+		created, err := runtime.EnsureNetwork(ctx, "", name, n.Driver, n.Options)
+		if err != nil {
+			return err
+		}
+		if created {
+			log.Info("network created", "network", name)
+		}
+	}
+	for _, v := range volumes {
+		name := expandIdentity(v.Name, names, env, stack)
+		if name == "" {
+			continue
+		}
+		created, err := runtime.EnsureVolume(ctx, "", name, v.Driver, v.Options)
+		if err != nil {
+			return err
+		}
+		if created {
+			log.Info("volume created", "volume", name)
+		}
+	}
+	return nil
 }
 
 // validateProxyBindings checks that every project proxy binding in the stack
@@ -918,7 +967,7 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 		for j, a := range n.Aliases {
 			aliases[j] = expandIdentity(a, names, opts.Env, stack)
 		}
-		nets[i] = proxy.ManagedNetwork{Name: expandIdentity(n.Name, names, opts.Env, stack), Aliases: aliases, Owned: n.Owned}
+		nets[i] = proxy.ManagedNetwork{Name: expandIdentity(n.Name, names, opts.Env, stack), Aliases: aliases}
 	}
 	composeYAML, err := prov.Compose(proxy.ManagedSpec{
 		Name:       mp.Name,

@@ -315,6 +315,63 @@ func Deploy(ctx context.Context, composeFile, project, node string, extraEnv []s
 	return nil
 }
 
+// EnsureNetwork creates the named docker network if it does not already exist,
+// so projects can join it as external without any project having to "own" it
+// via compose. It is idempotent: an existing network (or a concurrent create
+// that lost the race) is treated as success. Returns true when it created the
+// network. host is the docker "-H" endpoint ("" = local daemon).
+func EnsureNetwork(ctx context.Context, host, name, driver string, options map[string]string) (bool, error) {
+	if name == "" {
+		return false, fmt.Errorf("ensure network: empty name")
+	}
+	if _, err := output(ctx, "docker", dockerArgs(host, "network", "inspect", name)...); err == nil {
+		return false, nil
+	}
+	args := []string{"network", "create"}
+	if driver != "" {
+		args = append(args, "--driver", driver)
+	}
+	for k, v := range options {
+		args = append(args, "--opt", k+"="+v)
+	}
+	args = append(args, name)
+	if out, err := output(ctx, "docker", dockerArgs(host, args...)...); err != nil {
+		if strings.Contains(out, "already exists") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker network create %s: %w: %s", name, err, out)
+	}
+	return true, nil
+}
+
+// EnsureVolume creates the named docker volume if it does not already exist, so
+// a project can reference it as external instead of having compose create a
+// project-scoped one. Idempotent; returns true when it created the volume. host
+// is the docker "-H" endpoint ("" = local daemon).
+func EnsureVolume(ctx context.Context, host, name, driver string, options map[string]string) (bool, error) {
+	if name == "" {
+		return false, fmt.Errorf("ensure volume: empty name")
+	}
+	if _, err := output(ctx, "docker", dockerArgs(host, "volume", "inspect", name)...); err == nil {
+		return false, nil
+	}
+	args := []string{"volume", "create"}
+	if driver != "" {
+		args = append(args, "--driver", driver)
+	}
+	for k, v := range options {
+		args = append(args, "--opt", k+"="+v)
+	}
+	args = append(args, name)
+	if out, err := output(ctx, "docker", dockerArgs(host, args...)...); err != nil {
+		if strings.Contains(out, "already exists") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker volume create %s: %w: %s", name, err, out)
+	}
+	return true, nil
+}
+
 // Stop tears down a compose project (the old color after a successful switch).
 func Stop(ctx context.Context, project string) error {
 	out, err := output(ctx, "docker", "compose", "-p", project, "down")
