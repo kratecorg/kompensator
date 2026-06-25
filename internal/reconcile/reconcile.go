@@ -1086,6 +1086,13 @@ func buildEnv(names runtime.Names, envName, stack, project, proxyDir string, var
 		v := envVarName(svc)
 		merged[v+"_IMAGE"] = si.Image
 		merged[v+"_TAG"] = si.Tag
+		// A one-shot job exits after running, so it never appears in the
+		// running-image set. Keep it out of the refs compared against running
+		// containers (its tag still lands in extraEnv above and thus the config
+		// hash, so a new tag still triggers a redeploy that re-runs it).
+		if si.OneShot {
+			continue
+		}
 		refs[svc] = si.Ref()
 	}
 

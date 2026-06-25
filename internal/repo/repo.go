@@ -595,6 +595,13 @@ func MergeVariables(layers ...map[string]string) map[string]string {
 type ServiceImage struct {
 	Image string `yaml:"image"`
 	Tag   string `yaml:"tag"`
+	// OneShot marks a job container that runs to completion and exits (compose
+	// restart: "no"), e.g. a one-shot that publishes assets into a volume. Its
+	// image/tag is still injected and folded into the deploy fingerprint (so a
+	// new tag triggers a redeploy that re-runs it), but it is excluded from the
+	// running-image drift check, which would otherwise see the exited container
+	// as perpetually missing and redeploy on every reconcile.
+	OneShot bool `yaml:"oneShot,omitempty"`
 }
 
 // Ref returns the fully qualified image reference (image:tag).
