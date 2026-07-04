@@ -434,9 +434,10 @@ func cmdBootstrap(g globals, args []string) int {
 	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
 	repoName := fs.String("repo", "", "which repo the node follows (default: the sole repo)")
 	statusWriteback := fs.Bool("status-writeback", false, "publish reconcile status to the node's git status branch")
+	statusWritebackAlways := fs.Bool("status-writeback-always", false, "publish on every reconcile instead of only when the status changed")
 	schedule := fs.String("schedule", config.DefaultSchedule, "cron schedule for the node's self-reconcile")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback] [--schedule <cron>]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback] [--status-writeback-always] [--schedule <cron>]")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
@@ -459,13 +460,14 @@ func cmdBootstrap(g globals, args []string) int {
 
 	log := newLogger(g.jsonLog)
 	if err := admin.ProvisionNode(ctx, admin.ProvisionOptions{
-		ControllerHome:  h,
-		Name:            *name,
-		Location:        *location,
-		RepoName:        *repoName,
-		StatusWriteback: *statusWriteback,
-		Schedule:        *schedule,
-		Logger:          log,
+		ControllerHome:        h,
+		Name:                  *name,
+		Location:              *location,
+		RepoName:              *repoName,
+		StatusWriteback:       *statusWriteback,
+		StatusWritebackAlways: *statusWritebackAlways,
+		Schedule:              *schedule,
+		Logger:                log,
 	}); err != nil {
 		log.Error("bootstrap failed", "error", err)
 		return 1

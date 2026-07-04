@@ -55,6 +55,15 @@ type Config struct {
 	// node's status branch.
 	StatusWriteback bool
 
+	// StatusWritebackAlways controls how often an opted-in node publishes its
+	// status (RoleNode only; default off). When false the node pushes only when
+	// the status changed in substance since the last publish, i.e. any field
+	// other than the reconciledAt timestamp differs. This stops a node that
+	// reconciles on a tight schedule from force-pushing an otherwise identical
+	// status every run. When true the node publishes on every reconcile,
+	// refreshing the timestamp each time.
+	StatusWritebackAlways bool
+
 	// Schedule is the cron expression a node reconciles itself on (RoleNode
 	// only). It is recorded so the cron entry installed at bootstrap, and the
 	// 'check' command, share one source of truth. Empty means DefaultSchedule.
@@ -104,11 +113,12 @@ type controllerFile struct {
 
 // nodeFile is the on-disk shape of node.yml.
 type nodeFile struct {
-	Node            string  `yaml:"node"`
-	Naming          *Naming `yaml:"naming,omitempty"`
-	StatusWriteback bool    `yaml:"statusWriteback,omitempty"`
-	Schedule        string  `yaml:"schedule,omitempty"`
-	Repo            Repo    `yaml:"repo"`
+	Node                  string  `yaml:"node"`
+	Naming                *Naming `yaml:"naming,omitempty"`
+	StatusWriteback       bool    `yaml:"statusWriteback,omitempty"`
+	StatusWritebackAlways bool    `yaml:"statusWritebackAlways,omitempty"`
+	Schedule              string  `yaml:"schedule,omitempty"`
+	Repo                  Repo    `yaml:"repo"`
 }
 
 // Home returns the kompensator home directory.
@@ -206,7 +216,7 @@ func loadNode(path string) (*Config, error) {
 	if schedule == "" {
 		schedule = DefaultSchedule
 	}
-	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming, StatusWriteback: f.StatusWriteback, Schedule: schedule}, nil
+	return &Config{Role: RoleNode, NodeName: f.Node, Repos: []Repo{f.Repo}, Naming: f.Naming, StatusWriteback: f.StatusWriteback, StatusWritebackAlways: f.StatusWritebackAlways, Schedule: schedule}, nil
 }
 
 func validateRepo(r *Repo, path string, i int) error {
@@ -226,8 +236,8 @@ func MarshalController(repos []Repo, naming *Naming) ([]byte, error) {
 
 // MarshalNode renders a node.yml (header + YAML). It is shared by bootstrap when
 // provisioning a remote node's config over ssh.
-func MarshalNode(nodeName string, r Repo, naming *Naming, statusWriteback bool, schedule string) ([]byte, error) {
-	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, StatusWriteback: statusWriteback, Schedule: schedule, Repo: r})
+func MarshalNode(nodeName string, r Repo, naming *Naming, statusWriteback, statusWritebackAlways bool, schedule string) ([]byte, error) {
+	return marshal(nodeHeader, nodeFile{Node: nodeName, Naming: naming, StatusWriteback: statusWriteback, StatusWritebackAlways: statusWritebackAlways, Schedule: schedule, Repo: r})
 }
 
 func marshal(header string, v any) ([]byte, error) {
@@ -252,8 +262,8 @@ func WriteController(home string, repos []Repo, naming *Naming) error {
 }
 
 // WriteNode creates (or overwrites) node.yml in home.
-func WriteNode(home, nodeName string, r Repo, naming *Naming, statusWriteback bool, schedule string) error {
-	data, err := MarshalNode(nodeName, r, naming, statusWriteback, schedule)
+func WriteNode(home, nodeName string, r Repo, naming *Naming, statusWriteback, statusWritebackAlways bool, schedule string) error {
+	data, err := MarshalNode(nodeName, r, naming, statusWriteback, statusWritebackAlways, schedule)
 	if err != nil {
 		return err
 	}

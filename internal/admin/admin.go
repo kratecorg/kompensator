@@ -87,8 +87,11 @@ type ProvisionOptions struct {
 	Location        string // ssh://[user@]host[:port][/path] or an absolute local path
 	RepoName        string // which repo the node follows (default: the sole repo)
 	StatusWriteback bool   // enable publishing reconcile status to git
-	Schedule        string // cron expression for the node's self-reconcile (default: config.DefaultSchedule)
-	Logger          *slog.Logger
+	// StatusWritebackAlways, when true, publishes on every reconcile; when false
+	// (the default) the node only pushes when its status changed in substance.
+	StatusWritebackAlways bool
+	Schedule              string // cron expression for the node's self-reconcile (default: config.DefaultSchedule)
+	Logger                *slog.Logger
 }
 
 // ProvisionNode materialises a new node entirely from the controller: it copies
@@ -137,7 +140,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("resolve own binary: %w", err)
 	}
 
-	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming, opts.StatusWriteback, schedule)
+	cfgData, err := config.MarshalNode(opts.Name, r, ctrlCfg.Naming, opts.StatusWriteback, opts.StatusWritebackAlways, schedule)
 	if err != nil {
 		return err
 	}

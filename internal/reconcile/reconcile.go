@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -340,6 +341,10 @@ func gatherStatusFiles(home string) (map[string][]byte, error) {
 
 // publishStatus pushes the node's local status documents to its status branch.
 // It is a no-op for content that has not changed since the last publish.
+//
+// Unless the node opts into StatusWritebackAlways, a run whose only change is the
+// refreshed reconciledAt timestamp is skipped, so a node reconciling on a tight
+// schedule does not force-push an otherwise identical status every run.
 func publishStatus(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Config, r config.Repo) error {
 	files, err := gatherStatusFiles(opts.Home)
 	if err != nil {
@@ -350,11 +355,59 @@ func publishStatus(ctx context.Context, log *slog.Logger, opts Options, cfg *con
 	}
 	branch := statusBranch(r.Branch, cfg.NodeName)
 	gitDir := filepath.Join(opts.Home, "status-git", r.Name)
+	if !cfg.StatusWritebackAlways {
+		changed, err := statusChangedSincePublish(gitDir, files)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			log.Debug("status unchanged since last publish, skipping", "branch", branch)
+			return nil
+		}
+	}
 	if err := gitsync.PublishStatusBranch(ctx, gitDir, r.URL, branch, files, statusKeepCommits); err != nil {
 		return err
 	}
 	log.Info("status published", "branch", branch)
 	return nil
+}
+
+// statusChangedSincePublish reports whether the freshly gathered status files
+// differ from the ones last published to gitDir, ignoring the reconciledAt
+// timestamp so a mere heartbeat does not count as a change. A missing gitDir
+// (first publish) counts as changed.
+func statusChangedSincePublish(gitDir string, files map[string][]byte) (bool, error) {
+	published, err := gatherStatusFiles(gitDir)
+	if err != nil {
+		return false, err
+	}
+	if len(published) != len(files) {
+		return true, nil
+	}
+	for path, content := range files {
+		old, ok := published[path]
+		if !ok {
+			return true, nil
+		}
+		if !bytes.Equal(stripReconciledAt(old), stripReconciledAt(content)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// stripReconciledAt removes the reconciledAt line from a status document so two
+// documents that differ only in their timestamp compare equal.
+func stripReconciledAt(doc []byte) []byte {
+	lines := bytes.Split(doc, []byte("\n"))
+	kept := lines[:0]
+	for _, line := range lines {
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("reconciledAt:")) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return bytes.Join(kept, []byte("\n"))
 }
 
 // environment. Nodes are processed one at a time so a Blue/Green rollout never
