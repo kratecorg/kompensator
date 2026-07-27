@@ -852,7 +852,8 @@ func recreateProject(ctx context.Context, log *slog.Logger, names runtime.Names,
 	}
 	log.Info(reason, "running", describeImages(running), "desired", describeRefs(desiredRefs))
 
-	if err := runtime.Deploy(ctx, composeFile, proj, names.Node, extraEnv); err != nil {
+	labels := runtime.Labels{Repo: names.Repo, Node: names.Node, Env: opts.Env, Stack: stack, Project: project}
+	if err := runtime.Deploy(ctx, composeFile, proj, labels, extraEnv); err != nil {
 		return err
 	}
 	if err := runtime.WaitHealthy(ctx, proj, healthTimeout); err != nil {
@@ -922,7 +923,8 @@ func blueGreenProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	// alias "<service>-<color>") so the reverse proxy can address it. It is not
 	// part of the config hash: alternating colors are intended, not drift.
 	colorEnv := append(append([]string(nil), extraEnv...), "COLOR="+target)
-	if err := runtime.Deploy(ctx, composeFile, targetProject, names.Node, colorEnv); err != nil {
+	labels := runtime.Labels{Repo: names.Repo, Node: names.Node, Env: opts.Env, Stack: stack, Project: project, Color: target}
+	if err := runtime.Deploy(ctx, composeFile, targetProject, labels, colorEnv); err != nil {
 		return err
 	}
 	log.Info("waiting for new color to become healthy", "color", target, "project", targetProject)
@@ -1071,7 +1073,8 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 	}
 	plog.Info(reason)
 
-	if err := runtime.Deploy(ctx, composePath, proj, names.Node, extraEnv); err != nil {
+	labels := runtime.Labels{Repo: names.Repo, Node: names.Node, Env: opts.Env, Stack: stack, Project: project}
+	if err := runtime.Deploy(ctx, composePath, proj, labels, extraEnv); err != nil {
 		return err
 	}
 	if err := runtime.WaitHealthy(ctx, proj, healthTimeout); err != nil {

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -9,6 +10,53 @@ import (
 	"strings"
 	"time"
 )
+
+// Label keys kompensator stamps onto every service container it deploys. They
+// let a later reconcile identify kompensator-managed containers precisely (by
+// exact label match rather than by parsing the compose project name) and, above
+// all, tell them apart from foreign containers. Only a container carrying
+// LabelManaged may be torn down by an automated prune; anything without it is
+// treated as foreign and left untouched.
+const (
+	LabelManaged = "kompensator.managed"
+	LabelRepo    = "kompensator.repo"
+	LabelNode    = "kompensator.node"
+	LabelEnv     = "kompensator.env"
+	LabelStack   = "kompensator.stack"
+	LabelProject = "kompensator.project"
+	LabelColor   = "kompensator.color"
+)
+
+// Labels is the kompensator identity applied to every service container of a
+// deploy. The managed marker is always set; Color is empty for recreate and
+// managed-proxy projects.
+type Labels struct {
+	Repo    string
+	Node    string
+	Env     string
+	Stack   string
+	Project string
+	Color   string
+}
+
+// pairs returns the label key/value pairs to stamp on every service container.
+// LabelManaged is always present; the identity fields are included only when
+// set, so an omitted optional segment (e.g. Color) leaves no empty label behind.
+func (l Labels) pairs() [][2]string {
+	out := [][2]string{{LabelManaged, "true"}}
+	add := func(key, value string) {
+		if value != "" {
+			out = append(out, [2]string{key, value})
+		}
+	}
+	add(LabelRepo, l.Repo)
+	add(LabelNode, l.Node)
+	add(LabelEnv, l.Env)
+	add(LabelStack, l.Stack)
+	add(LabelProject, l.Project)
+	add(LabelColor, l.Color)
+	return out
+}
 
 // Colors are the two Blue/Green deployment slots. A Blue/Green reconcile always
 // deploys the new version into the slot the project is not currently running
@@ -299,20 +347,89 @@ func shortHealth(status string) string {
 // importantly the contents of bind-mounted config files such as haproxy.cfg —
 // are actually applied. On the in-sync path Deploy is not called at all, so
 // this never churns healthy containers needlessly.
-func Deploy(ctx context.Context, composeFile, project, node string, extraEnv []string) error {
+//
+// Deploy stamps kompensator's identity labels (see Labels) onto every service
+// via a generated override compose file merged with -f, so later reconciles can
+// recognise the containers as kompensator-managed. --force-recreate guarantees
+// the labels are (re)applied even when nothing else changed.
+func Deploy(ctx context.Context, composeFile, project string, labels Labels, extraEnv []string) error {
+	env := append(os.Environ(), "NODE_NAME="+labels.Node)
+	env = append(env, extraEnv...)
+
+	services, err := composeServices(ctx, composeFile, env)
+	if err != nil {
+		return err
+	}
+	overrideFile, err := writeLabelOverride(services, labels)
+	if err != nil {
+		return fmt.Errorf("write label override (%s): %w", project, err)
+	}
+	defer os.Remove(overrideFile)
+
 	cmd := exec.CommandContext(ctx, "docker", "compose",
 		"-p", project,
 		"-f", composeFile,
+		"-f", overrideFile,
 		"up", "-d", "--remove-orphans", "--force-recreate",
 	)
-	cmd.Env = append(os.Environ(), "NODE_NAME="+node)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Env = env
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("docker compose up (%s): %w", project, err)
 	}
 	return nil
+}
+
+// composeServices returns the service names a compose file defines, resolved
+// with the deploy env so variable-interpolated and profile-gated files list
+// exactly the services `up` will create. It is the set a label override must
+// enumerate to stamp a label on every container.
+func composeServices(ctx context.Context, composeFile string, env []string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "config", "--services")
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("docker compose config --services (%s): %w: %s", composeFile, err, strings.TrimSpace(stderr.String()))
+	}
+	var services []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			services = append(services, s)
+		}
+	}
+	return services, nil
+}
+
+// writeLabelOverride writes a compose override file that stamps the kompensator
+// identity labels onto every given service and returns its path; the caller
+// removes it after the deploy. Merged with -f after the base file, its labels
+// are added to whatever each service already declares.
+func writeLabelOverride(services []string, labels Labels) (string, error) {
+	var b strings.Builder
+	b.WriteString("services:\n")
+	for _, service := range services {
+		fmt.Fprintf(&b, "  %q:\n    labels:\n", service)
+		for _, kv := range labels.pairs() {
+			fmt.Fprintf(&b, "      %q: %q\n", kv[0], kv[1])
+		}
+	}
+	f, err := os.CreateTemp("", "kompensator-labels-*.yml")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // EnsureNetwork creates the named docker network if it does not already exist,
