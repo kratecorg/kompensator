@@ -600,10 +600,12 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		if err != nil {
 			return res, fmt.Errorf("stack %q: %w", stackName, err)
 		}
-		vars := repo.MergeVariables(stack.Variables, env.Variables, env.NodeVars(names.Node))
-		// The managed proxy's networks decide which of a service's (possibly
-		// several) network IPs the proxy can actually reach it on. Expanded once
-		// here and threaded into the proxy switch.
+		// Variables resolve in nested scopes, broad to narrow, each layer
+		// overriding the previous (see repository-layout.md):
+		//   stack defaults < env < env+node < stack-placement < stack-placement+node
+		//   < project-placement < project-placement+node < secrets.
+		// The declared-variable layers are folded per project by ResolveVariables;
+		// the stack's decrypted secrets win over all of them.
 		var proxyNets []string
 		if stack.Proxy != nil {
 			for _, n := range stack.Proxy.Networks {
@@ -614,13 +616,14 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		if err != nil {
 			return res, fmt.Errorf("stack %q secrets: %w", stackName, err)
 		}
-		for k, v := range secretVars {
-			vars[k] = v
-		}
 		for _, p := range stack.Projects {
 			if !placement.ProjectRunsOn(p.Name, names.Node) {
 				log.Info("project not placed on this node, skipping", "stack", stackName, "project", p.Name, "node", names.Node)
 				continue
+			}
+			vars := repo.ResolveVariables(stack.Variables, env, placement, p.Name, names.Node)
+			for k, v := range secretVars {
+				vars[k] = v
 			}
 			if err := reconcileProject(ctx, log, names, opts, repoRoot, stackName, p, vars, state[p.Name], proxyNets, &res); err != nil {
 				log.Error("project reconcile failed", "stack", stackName, "project", p.Name, "error", err)

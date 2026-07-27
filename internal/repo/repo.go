@@ -239,6 +239,32 @@ type StackPlacement struct {
 	// Projects pins individual projects of the stack to a node subset. A project
 	// not listed here inherits the stack-level placement.
 	Projects []ProjectPlacement `yaml:"projects,omitempty"`
+	// Variables are values injected for this stack in this environment. In the
+	// variable-resolution order they sit above the environment-wide variables and
+	// below the per-project ones, letting "this stack in this env" diverge without
+	// touching the env-wide defaults (see the merge order in reconcileRepo).
+	Variables map[string]string `yaml:"variables,omitempty"`
+	// NodeVariables are per-node overrides for this stack placement, keyed by node
+	// name. Only the reconciling node's entry applies and it wins over Variables.
+	NodeVariables map[string]map[string]string `yaml:"nodeVariables,omitempty"`
+}
+
+// NodeVars returns this stack placement's per-node variable overrides for the
+// named node, or nil if none are defined.
+func (s StackPlacement) NodeVars(node string) map[string]string {
+	return s.NodeVariables[node]
+}
+
+// Project returns the placement entry for the named project, or the zero value
+// if the project has no explicit placement (it then inherits the stack-level
+// placement and carries no project-scoped variables).
+func (s StackPlacement) Project(name string) ProjectPlacement {
+	for _, p := range s.Projects {
+		if p.Name == name {
+			return p
+		}
+	}
+	return ProjectPlacement{}
 }
 
 // ProjectPlacement pins one project of a stack to a subset of nodes within the
@@ -248,6 +274,20 @@ type ProjectPlacement struct {
 	// Nodes pins the project to these node names. Empty means "wherever the
 	// stack runs" (no project-level pin).
 	Nodes NodeList `yaml:"nodes,omitempty"`
+	// Variables are values injected for this project in this environment. They are
+	// the most specific non-node layer and win over the stack- and env-level
+	// variables (see the merge order in reconcileRepo).
+	Variables map[string]string `yaml:"variables,omitempty"`
+	// NodeVariables are per-node overrides for this project placement, keyed by
+	// node name. Only the reconciling node's entry applies and it is the most
+	// specific layer of all — it wins over every other variable source.
+	NodeVariables map[string]map[string]string `yaml:"nodeVariables,omitempty"`
+}
+
+// NodeVars returns this project placement's per-node variable overrides for the
+// named node, or nil if none are defined.
+func (p ProjectPlacement) NodeVars(node string) map[string]string {
+	return p.NodeVariables[node]
 }
 
 // NodeList is a list of node names that decodes from either a single scalar
@@ -577,10 +617,12 @@ func (p Project) BlueGreen() bool {
 	return !strings.EqualFold(strings.TrimSpace(p.Strategy), StrategyRecreate)
 }
 
-// MergeVariables returns the effective variables for a stack in an environment:
-// each layer overlays the previous one, so later arguments win. Typical order
-// is stack defaults, environment variables, then per-node overrides. No input
-// is mutated; the result is always non-nil.
+// MergeVariables returns the effective variables from a set of layers: each
+// layer overlays the previous one, so later arguments win. The reconciler feeds
+// the scopes broad to narrow (stack defaults, env, env+node, stack placement,
+// stack placement+node, project placement, project placement+node), so the
+// narrowest scope wins and, within a scope, the per-node layer wins over the
+// all-nodes one. No input is mutated; the result is always non-nil.
 func MergeVariables(layers ...map[string]string) map[string]string {
 	merged := make(map[string]string)
 	for _, layer := range layers {
@@ -589,6 +631,32 @@ func MergeVariables(layers ...map[string]string) map[string]string {
 		}
 	}
 	return merged
+}
+
+// ResolveVariables computes the effective declared variables for one project of
+// one stack on one node, applying the nested scopes broad to narrow (each layer
+// overrides the previous):
+//
+//	stack defaults (stack.yml)
+//	  < env.variables < env.nodeVariables[node]
+//	  < placement.variables < placement.nodeVariables[node]
+//	  < project.variables < project.nodeVariables[node]
+//
+// Within a scope the per-node layer wins over the all-nodes one, and a narrower
+// scope wins over a broader one — so an inner all-nodes value still beats an
+// outer per-node value. Secrets and identity built-ins are layered on top by
+// the caller and are not part of this result.
+func ResolveVariables(stackDefaults map[string]string, env Environment, placement StackPlacement, project, node string) map[string]string {
+	proj := placement.Project(project)
+	return MergeVariables(
+		stackDefaults,
+		env.Variables,
+		env.NodeVars(node),
+		placement.Variables,
+		placement.NodeVars(node),
+		proj.Variables,
+		proj.NodeVars(node),
+	)
 }
 
 // ServiceImage is the desired image and tag for a single service.
