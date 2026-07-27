@@ -161,12 +161,16 @@ func cmdStatus(g globals, args []string) int {
 	}
 
 	drift := 0
+	orphans := 0
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "NODE\tENV\tSTACK\tPROJECT\tSERVICE\tCOLOR\tCONTAINER\tTARGET\tRUNNING\tHEALTH\tSTATUS")
 	for _, s := range statuses {
 		state := s.State()
-		if state == "drift" || state == "missing" {
+		switch state {
+		case "drift", "missing":
 			drift++
+		case "orphan":
+			orphans++
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			dash(s.Node), s.Env, s.Stack, s.Project, s.Service, dash(s.Color), dash(s.Container),
@@ -174,8 +178,14 @@ func cmdStatus(g globals, args []string) int {
 	}
 	tw.Flush()
 
+	if orphans > 0 {
+		fmt.Printf("\n%d managed container(s) no longer placed here (orphans). "+
+			"Their volumes are left intact; remove them manually.\n", orphans)
+	}
 	if drift > 0 {
 		fmt.Printf("\n%d container(s) drifting from target.\n", drift)
+	}
+	if drift > 0 || orphans > 0 {
 		return 1
 	}
 	return 0

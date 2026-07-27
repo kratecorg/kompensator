@@ -533,6 +533,68 @@ func ListProjects(ctx context.Context, host, prefix string) ([]string, error) {
 	return projects, nil
 }
 
+// ManagedProject is one compose project kompensator created, identified by the
+// kompensator.* labels it stamps on every container. Because it is discovered
+// via LabelManaged, anything ListManagedProjects returns is kompensator's own —
+// foreign projects never appear.
+type ManagedProject struct {
+	Name    string // docker compose project name
+	Env     string
+	Stack   string
+	Project string
+	Color   string // Blue/Green slot, or "" (recreate / managed proxy)
+}
+
+// ListManagedProjects returns the distinct kompensator-managed compose projects
+// on host, scoped to a repo and node and, when env is non-empty, to that env.
+// It filters on LabelManaged so only kompensator's own containers are ever
+// considered — the caller may safely act on the result without risking a
+// foreign container. host is the docker "-H" endpoint ("" = local daemon).
+func ListManagedProjects(ctx context.Context, host, repo, node, env string) ([]ManagedProject, error) {
+	args := []string{"ps", "-a", "--filter", "label=" + LabelManaged + "=true"}
+	if repo != "" {
+		args = append(args, "--filter", "label="+LabelRepo+"="+repo)
+	}
+	if node != "" {
+		args = append(args, "--filter", "label="+LabelNode+"="+node)
+	}
+	if env != "" {
+		args = append(args, "--filter", "label="+LabelEnv+"="+env)
+	}
+	const fmtStr = `{{.Label "com.docker.compose.project"}}` + "\t" +
+		`{{.Label "` + LabelEnv + `"}}` + "\t" +
+		`{{.Label "` + LabelStack + `"}}` + "\t" +
+		`{{.Label "` + LabelProject + `"}}` + "\t" +
+		`{{.Label "` + LabelColor + `"}}`
+	args = append(args, "--format", fmtStr)
+
+	out, err := output(ctx, "docker", dockerArgs(host, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
+	}
+	seen := map[string]bool{}
+	var projects []ManagedProject
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 5)
+		if len(parts) != 5 {
+			continue
+		}
+		name := parts[0]
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		projects = append(projects, ManagedProject{
+			Name: name, Env: parts[1], Stack: parts[2], Project: parts[3], Color: parts[4],
+		})
+	}
+	sort.Slice(projects, func(i, j int) bool { return projects[i].Name < projects[j].Name })
+	return projects, nil
+}
+
 // WaitHealthy blocks until every container of the project reports healthy, or
 // the timeout elapses. Containers without a healthcheck count as healthy as
 // soon as they are running, so plain images deploy without extra config while

@@ -1,5 +1,4 @@
 package runtime
-package runtime
 
 import (
 	"os"

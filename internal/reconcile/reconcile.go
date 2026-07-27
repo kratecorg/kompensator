@@ -1297,11 +1297,14 @@ type ServiceStatus struct {
 	Container string // short container name, e.g. "frontend-1", or ""
 	Running   string // "image:tag" of this container, or "" if not running
 	Health    string // concise health token
+	Orphan    bool   // a kompensator-managed container the desired state no longer places here
 }
 
 // State summarises the row's status as a short word.
 func (s ServiceStatus) State() string {
 	switch {
+	case s.Orphan:
+		return "orphan"
 	case s.Desired == "":
 		return "no-target"
 	case s.Running == "":
@@ -1383,6 +1386,11 @@ func Status(ctx context.Context, opts Options) ([]ServiceStatus, error) {
 				}
 				out = append(out, rows...)
 			}
+			orphans, err := statusOrphans(ctx, dest, names, t, envs, opts.Env)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, orphans...)
 		}
 	}
 	return out, nil
@@ -1479,6 +1487,88 @@ func statusProject(ctx context.Context, t statusTarget, names runtime.Names, env
 		}
 	}
 	return out, nil
+}
+
+// statusOrphans reports kompensator-managed compose projects present on a node
+// that the desired state (git) no longer places there — e.g. a project pinned
+// to another node, or an environment removed from git. Discovery is scoped to
+// the managed marker, so foreign containers are never reported. Volumes are
+// deliberately ignored: removing them stays a manual step.
+func statusOrphans(ctx context.Context, repoRoot string, names runtime.Names, t statusTarget, envs []string, envFilter string) ([]ServiceStatus, error) {
+	desired, err := desiredIdentities(repoRoot, t.node, envs)
+	if err != nil {
+		return nil, err
+	}
+	managed, err := runtime.ListManagedProjects(ctx, t.dockerHost, names.Repo, t.node, envFilter)
+	if err != nil {
+		return nil, fmt.Errorf("node %q: list managed projects: %w", t.node, err)
+	}
+
+	var out []ServiceStatus
+	for _, mp := range managed {
+		if desired[identityKey(mp.Env, mp.Stack, mp.Project)] {
+			continue
+		}
+		containers, err := runtime.ProjectContainers(ctx, t.dockerHost, mp.Name)
+		if err != nil {
+			return nil, fmt.Errorf("node %q: %w", t.node, err)
+		}
+		base := ServiceStatus{
+			Node: t.node, Repo: names.Repo, Env: mp.Env,
+			Stack: mp.Stack, Project: mp.Project, Color: mp.Color, Orphan: true,
+		}
+		if len(containers) == 0 {
+			out = append(out, base)
+			continue
+		}
+		for _, c := range containers {
+			st := base
+			st.Service = c.Service
+			st.Container = c.Name
+			st.Running = c.Image
+			st.Health = c.Health
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+// desiredIdentities returns the (env, stack, project) identities the desired
+// state places on the node across the given environments, including the
+// synthetic "proxy-<name>" project of every stack that runs a managed proxy. It
+// is the reference statusOrphans diffs the running managed projects against.
+func desiredIdentities(repoRoot, node string, envs []string) (map[string]bool, error) {
+	desired := map[string]bool{}
+	for _, env := range envs {
+		e, err := repo.LoadEnvironment(repoRoot, env)
+		if err != nil {
+			return nil, fmt.Errorf("env %q: %w", env, err)
+		}
+		for _, placement := range e.Stacks {
+			if !placement.StackRunsOn(node) {
+				continue
+			}
+			stack, err := repo.LoadStack(repoRoot, placement.Name)
+			if err != nil {
+				return nil, fmt.Errorf("stack %q: %w", placement.Name, err)
+			}
+			for _, p := range stack.Projects {
+				if placement.ProjectRunsOn(p.Name, node) {
+					desired[identityKey(env, placement.Name, p.Name)] = true
+				}
+			}
+			if stack.Proxy != nil {
+				desired[identityKey(env, placement.Name, "proxy-"+stack.Proxy.Name)] = true
+			}
+		}
+	}
+	return desired, nil
+}
+
+// identityKey builds the comparison key for a (env, stack, project) identity,
+// using a separator that cannot occur in any of the segments.
+func identityKey(env, stack, project string) string {
+	return env + "\x00" + stack + "\x00" + project
 }
 
 // projectContainers lists a project's containers across the relevant compose
