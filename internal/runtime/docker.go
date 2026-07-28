@@ -572,10 +572,20 @@ func ListManagedProjects(ctx context.Context, host, repo, node, env string) ([]M
 	if err != nil {
 		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
 	}
+	return parseManagedProjects(out), nil
+}
+
+// parseManagedProjects turns the tab-separated `docker ps` output of
+// ListManagedProjects into distinct projects. It splits on newlines only and
+// never trims the lines with TrimSpace: the last field (color) is empty for
+// recreate and managed-proxy projects, so the line ends in a tab that TrimSpace
+// would eat — dropping a field and, with it, the whole row.
+func parseManagedProjects(out string) []ManagedProject {
 	seen := map[string]bool{}
 	var projects []ManagedProject
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if strings.TrimSpace(line) == "" {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
 			continue
 		}
 		parts := strings.SplitN(line, "\t", 5)
@@ -592,7 +602,7 @@ func ListManagedProjects(ctx context.Context, host, repo, node, env string) ([]M
 		})
 	}
 	sort.Slice(projects, func(i, j int) bool { return projects[i].Name < projects[j].Name })
-	return projects, nil
+	return projects
 }
 
 // WaitHealthy blocks until every container of the project reports healthy, or

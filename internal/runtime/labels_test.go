@@ -61,3 +61,48 @@ func TestWriteLabelOverrideStampsEveryService(t *testing.T) {
 		t.Errorf("override missing color label:\n%s", content)
 	}
 }
+
+// TestParseManagedProjectsKeepsEmptyColor guards a regression: a managed proxy
+// (or any recreate project) has an empty color, so its `docker ps` line ends in
+// a tab. The parser must keep all five fields — TrimSpace would eat the trailing
+// tab and drop the row, hiding the project from orphan detection.
+func TestParseManagedProjectsKeepsEmptyColor(t *testing.T) {
+	// Exactly what `docker ps` prints for the customer03 managed proxy: five
+	// tab-separated fields, the last (color) empty, then a trailing newline.
+	out := "cd-customer03-spanning-carimco-proxy-internal\tspanning\tcarimco\tproxy-internal\t\n"
+
+	got := parseManagedProjects(out)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 managed project, got %d: %+v", len(got), got)
+	}
+	want := ManagedProject{
+		Name:    "cd-customer03-spanning-carimco-proxy-internal",
+		Env:     "spanning",
+		Stack:   "carimco",
+		Project: "proxy-internal",
+		Color:   "",
+	}
+	if got[0] != want {
+		t.Errorf("parsed %+v, want %+v", got[0], want)
+	}
+}
+
+// TestParseManagedProjectsDedupesAndKeepsColor covers multi-line output with a
+// non-empty color and duplicate rows (one per container replica).
+func TestParseManagedProjectsDedupesAndKeepsColor(t *testing.T) {
+	out := "" +
+		"cd-n1-prod-web-app-blue\tprod\tweb\tapp\tblue\n" +
+		"cd-n1-prod-web-app-blue\tprod\tweb\tapp\tblue\n" + // second replica, same project
+		"cd-n1-prod-web-proxy-internal\tprod\tweb\tproxy-internal\t\n"
+
+	got := parseManagedProjects(out)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 distinct projects, got %d: %+v", len(got), got)
+	}
+	if got[0].Color != "blue" {
+		t.Errorf("first project color = %q, want blue", got[0].Color)
+	}
+	if got[1].Project != "proxy-internal" || got[1].Color != "" {
+		t.Errorf("second project = %+v, want proxy-internal with empty color", got[1])
+	}
+}
