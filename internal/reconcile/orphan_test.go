@@ -119,6 +119,26 @@ func TestServiceStatusStateOrphan(t *testing.T) {
 	}
 }
 
+// TestServiceStatusStateOneShot verifies a one-shot job is not reported as
+// drift: an exited container (running image differs from the desired ref by
+// design, e.g. a flavor prefix) is "done", while a one-shot that never produced
+// a container is still "missing".
+func TestServiceStatusStateOneShot(t *testing.T) {
+	done := ServiceStatus{
+		OneShot: true,
+		Desired: "reg/apk:c81ae54",
+		Running: "reg/apk:dev-c81ae54", // flavor-prefixed, differs on purpose
+	}
+	if got := done.State(); got != "done" {
+		t.Errorf("exited one-shot State() = %q, want done", got)
+	}
+
+	neverRan := ServiceStatus{OneShot: true, Desired: "reg/apk:c81ae54"}
+	if got := neverRan.State(); got != "missing" {
+		t.Errorf("one-shot that never ran State() = %q, want missing", got)
+	}
+}
+
 // TestPruneOrphansSkipsUndefinedEnv verifies the safety guard: when the env is
 // not defined in the repo, prune does nothing — and never queries docker, since
 // without a desired set it cannot tell an orphan from a legitimate container.

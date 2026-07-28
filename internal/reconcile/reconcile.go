@@ -1324,6 +1324,7 @@ type ServiceStatus struct {
 	Container string // short container name, e.g. "frontend-1", or ""
 	Running   string // "image:tag" of this container, or "" if not running
 	Health    string // concise health token
+	OneShot   bool   // a job that runs to completion and exits by design
 	Orphan    bool   // a kompensator-managed container the desired state no longer places here
 }
 
@@ -1332,6 +1333,15 @@ func (s ServiceStatus) State() string {
 	switch {
 	case s.Orphan:
 		return "orphan"
+	case s.OneShot:
+		// A one-shot runs to completion and exits by design; its running image is
+		// intentionally left out of drift detection (its tag may even differ from
+		// the desired ref, e.g. a build flavor prefix). So a one-shot that produced
+		// a container is done, not drift; one that never ran is still missing.
+		if s.Running == "" {
+			return "missing"
+		}
+		return "done"
 	case s.Desired == "":
 		return "no-target"
 	case s.Running == "":
@@ -1491,13 +1501,15 @@ func statusProject(ctx context.Context, t statusTarget, names runtime.Names, env
 
 	var out []ServiceStatus
 	for _, svc := range sorted {
+		si, hasDesired := desired[svc]
 		desiredRef := ""
-		if si, ok := desired[svc]; ok && si.Image != "" && si.Tag != "" {
+		if hasDesired && si.Image != "" && si.Tag != "" {
 			desiredRef = si.Ref()
 		}
 		base := ServiceStatus{
 			Node: t.node, Repo: names.Repo, Env: env,
 			Stack: stack, Project: p.Name, Service: svc, Desired: desiredRef,
+			OneShot: hasDesired && si.OneShot,
 		}
 		cs := bySvc[svc]
 		if len(cs) == 0 {
