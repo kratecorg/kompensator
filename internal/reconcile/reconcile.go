@@ -33,6 +33,7 @@ type Options struct {
 	Env     string // empty means: every environment (in the selected repos)
 	Repo    string // empty means: every configured repo; else only this repo
 	Force   bool   // redeploy even when the desired images are already running
+	Prune   bool   // tear down kompensator-managed containers no longer placed here
 	JSONLog bool   // pass -json through to node agents (controller mode)
 	Logger  *slog.Logger
 }
@@ -178,6 +179,16 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 		}
 		res, rerr := reconcileRepo(ctx, log, names, opts, dest)
 		total.add(res)
+
+		// Prune runs after convergence so a Blue/Green switch has already stopped
+		// the idle color; only whole projects the desired state no longer places
+		// here remain to tear down. It is best-effort cleanup: a failure is logged
+		// but does not fail the reconcile.
+		if opts.Prune {
+			if err := pruneOrphans(ctx, log, names, opts, dest); err != nil {
+				log.Warn("prune orphans failed", "repo", r.Name, "env", opts.Env, "error", err)
+			}
+		}
 
 		// Finalise the environment's status document regardless of outcome, so a
 		// partial failure is recorded as unhealthy for the pipeline to observe.
@@ -482,9 +493,13 @@ func reconcileTargets(ctx context.Context, log *slog.Logger, opts Options, cfg *
 			return nil, fmt.Errorf("repo %q: %w", r.Name, err)
 		}
 		for _, n := range inv.Nodes {
-			if !env.RunsOnNode(n.Name) {
+			if !opts.Prune && !env.RunsOnNode(n.Name) {
 				continue // every stack pinned away from this node
 			}
+			// With --prune, trigger every node of the env — including those that
+			// now run none of its stacks — so each can tear down its own orphans
+			// (e.g. a stack pinned entirely away leaves a node running nothing but
+			// still holding the old containers).
 			if n.Location == "" {
 				return nil, fmt.Errorf("node %q has no location; controller cannot trigger reconcile", n.Name)
 			}
@@ -515,6 +530,9 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 	sub := []string{"reconcile"}
 	if opts.Force {
 		sub = append(sub, "--force")
+	}
+	if opts.Prune {
+		sub = append(sub, "--prune")
 	}
 	sub = append(sub, opts.Env)
 
@@ -589,6 +607,15 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		}
 		if err := validateProxyBindings(stack); err != nil {
 			return res, err
+		}
+		// A stack whose every project is pinned away from this node has nothing to
+		// run here — not even its managed proxy, which exists only to front the
+		// stack's local projects. The stack-level pin (StackRunsOn) alone is too
+		// coarse: it stays true when the projects carry their own (excluding) pins,
+		// so without this check the proxy would deploy on a node with no backends.
+		if !stackHasProjectOn(placement, stack, names.Node) {
+			log.Info("stack has no project on this node, skipping (incl. managed proxy)", "stack", stackName, "node", names.Node)
+			continue
 		}
 		// Phase 0 (per stack): create the stack's networks/volumes before any of
 		// its projects — or its managed proxy — deploy, so projects only ever join
@@ -1533,6 +1560,52 @@ func statusOrphans(ctx context.Context, repoRoot string, names runtime.Names, t 
 	return out, nil
 }
 
+// pruneOrphans tears down the kompensator-managed containers on this node that
+// the desired state no longer places in the reconciled environment — a project
+// pinned to another node, or a stack pinned entirely away. It is scoped three
+// ways so it can never touch anything it should not: to this env (the env
+// label), to kompensator's own containers (the managed label, via
+// ListManagedProjects), and to containers only — it runs `docker compose down`
+// WITHOUT -v, so named/external volumes survive for a deliberate manual step.
+//
+// When the env is not defined in this repo, prune does nothing: without a
+// desired set it cannot tell an orphan from a legitimate container.
+func pruneOrphans(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot string) error {
+	if _, err := repo.LoadEnvironment(repoRoot, opts.Env); err != nil {
+		log.Info("env not defined in this repo, skipping prune", "repo", names.Repo, "env", opts.Env)
+		return nil
+	}
+	desired, err := desiredIdentities(repoRoot, names.Node, []string{opts.Env})
+	if err != nil {
+		return err
+	}
+	managed, err := runtime.ListManagedProjects(ctx, "", names.Repo, names.Node, opts.Env)
+	if err != nil {
+		return fmt.Errorf("list managed projects: %w", err)
+	}
+
+	var pruned, failed int
+	for _, mp := range managed {
+		if desired[identityKey(mp.Env, mp.Stack, mp.Project)] {
+			continue
+		}
+		log.Info("pruning orphan project", "project", mp.Name, "stack", mp.Stack, "compose_project", mp.Project, "color", mp.Color)
+		if err := runtime.Down(ctx, "", mp.Name); err != nil {
+			log.Error("prune orphan failed", "project", mp.Name, "error", err)
+			failed++
+			continue
+		}
+		pruned++
+	}
+	if pruned > 0 || failed > 0 {
+		log.Info("prune finished", "env", opts.Env, "pruned", pruned, "failed", failed)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d orphan project(s) failed to tear down", failed)
+	}
+	return nil
+}
+
 // desiredIdentities returns the (env, stack, project) identities the desired
 // state places on the node across the given environments, including the
 // synthetic "proxy-<name>" project of every stack that runs a managed proxy. It
@@ -1552,17 +1625,35 @@ func desiredIdentities(repoRoot, node string, envs []string) (map[string]bool, e
 			if err != nil {
 				return nil, fmt.Errorf("stack %q: %w", placement.Name, err)
 			}
+			hasProject := false
 			for _, p := range stack.Projects {
 				if placement.ProjectRunsOn(p.Name, node) {
 					desired[identityKey(env, placement.Name, p.Name)] = true
+					hasProject = true
 				}
 			}
-			if stack.Proxy != nil {
+			// The managed proxy runs (and is thus desired) only where at least one
+			// of the stack's projects runs — it fronts those local projects. Without
+			// this, a node with every project pinned away would count the proxy as
+			// desired and never flag a leftover proxy container as an orphan.
+			if hasProject && stack.Proxy != nil {
 				desired[identityKey(env, placement.Name, "proxy-"+stack.Proxy.Name)] = true
 			}
 		}
 	}
 	return desired, nil
+}
+
+// stackHasProjectOn reports whether at least one of the stack's projects is
+// placed on the node. A stack whose every project is pinned away has nothing to
+// run there, so neither its managed proxy nor its shared networks are needed.
+func stackHasProjectOn(placement repo.StackPlacement, stack repo.Stack, node string) bool {
+	for _, p := range stack.Projects {
+		if placement.ProjectRunsOn(p.Name, node) {
+			return true
+		}
+	}
+	return false
 }
 
 // identityKey builds the comparison key for a (env, stack, project) identity,

@@ -80,9 +80,10 @@ func main() {
 func cmdReconcile(g globals, args []string) int {
 	fs := flag.NewFlagSet("reconcile", flag.ContinueOnError)
 	force := fs.Bool("force", false, "redeploy even when the desired image is already running")
+	prune := fs.Bool("prune", false, "tear down kompensator-managed containers no longer placed here (containers only; volumes are left intact)")
 	repoName := fs.String("repo", "", "limit to this repo (default: all configured repos)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] [--repo <name>] [<env>]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] [--prune] [--repo <name>] [<env>]")
 		fmt.Fprintln(os.Stderr, "  Omitting <env> reconciles every environment.")
 		fs.PrintDefaults()
 	}
@@ -111,6 +112,7 @@ func cmdReconcile(g globals, args []string) int {
 		Env:     env,
 		Repo:    *repoName,
 		Force:   *force,
+		Prune:   *prune,
 		JSONLog: g.jsonLog,
 		Logger:  log,
 	}); err != nil {
