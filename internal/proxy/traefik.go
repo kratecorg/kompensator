@@ -148,6 +148,7 @@ func (traefik) Compose(spec ManagedSpec) ([]byte, error) {
 					"--providers.file.directory=/dynamic",
 					"--providers.file.watch=true",
 					"--entryPoints." + traefikEntryPoint + ".address=:80",
+					"--entryPoints." + traefikEntryPoint + ".forwardedHeaders.trustedIPs=172.16.0.0/12,fd00::/8",
 					"--log.level=INFO",
 				},
 				Volumes:  []string{spec.DynamicDir + ":/dynamic:ro"},
