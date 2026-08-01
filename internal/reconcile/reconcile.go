@@ -587,6 +587,13 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		return res, fmt.Errorf("env %q resources: %w", opts.Env, err)
 	}
 
+	// Phase 0b: materialise file secrets before any project deploys, so a bind-
+	// mounted secret is on disk when its consumer starts and a "recreate" reload
+	// can invalidate the consumer's fingerprint ahead of the deploy loop.
+	if err := materializeFileSecrets(ctx, log, names, opts, repoRoot, env); err != nil {
+		return res, fmt.Errorf("env %q file secrets: %w", opts.Env, err)
+	}
+
 	for _, placement := range env.Stacks {
 		stackName := placement.Name
 		if !placement.StackRunsOn(names.Node) {
@@ -809,6 +816,49 @@ func writeDeployHash(home, env, stack, project, hash string) error {
 		d.Env = env
 	}
 	d.project(deployKey(stack, project)).ConfigHash = hash
+	return d.save(home, env)
+}
+
+// invalidateDeployHash clears a project's recorded config fingerprint so the
+// next deploy pass treats it as drifted and recreates it. It is used by the
+// "recreate" secret reload strategy: after a bind-mounted file secret changed,
+// the consuming project must be recreated (--force-recreate) to pick it up.
+func invalidateDeployHash(home, env, stack, project string) error {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
+		return err
+	}
+	if p := d.Projects[deployKey(stack, project)]; p != nil && p.ConfigHash != "" {
+		p.ConfigHash = ""
+		return d.save(home, env)
+	}
+	return nil
+}
+
+// readSecretHash returns the content hash of the file secret last materialised
+// on this node, or "" when it has never been written.
+func readSecretHash(home, env, name string) string {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
+		return ""
+	}
+	return d.Secrets[name]
+}
+
+// writeSecretHash records the content hash of a just-materialised file secret,
+// leaving every other field of the status document untouched.
+func writeSecretHash(home, env, name, hash string) error {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
+		return err
+	}
+	if d.Env == "" {
+		d.Env = env
+	}
+	if d.Secrets == nil {
+		d.Secrets = map[string]string{}
+	}
+	d.Secrets[name] = hash
 	return d.save(home, env)
 }
 

@@ -31,6 +31,10 @@ type statusDoc struct {
 	ReconciledAt  string                    `yaml:"reconciledAt,omitempty"`
 	Healthy       bool                      `yaml:"healthy"`
 	Projects      map[string]*projectStatus `yaml:"projects,omitempty"`
+	// Secrets records the content hash of each file secret last materialised on
+	// this node, keyed by secret name. It drives change detection: a secret whose
+	// hash still matches is already on disk and its reload hook is not re-run.
+	Secrets map[string]string `yaml:"secrets,omitempty"`
 }
 
 // projectStatus is the recorded state of one project, keyed in the document by

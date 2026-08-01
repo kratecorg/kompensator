@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -546,13 +547,17 @@ func dash(s string) string {
 
 func cmdSecrets(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets <set|show|edit|rekey> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets <set|set-key|set-file|show|edit|rekey> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "set":
 		return cmdSecretsSet(g, rest)
+	case "set-key":
+		return cmdSecretsSetKey(g, rest)
+	case "set-file":
+		return cmdSecretsSetFile(g, rest)
 	case "show":
 		return cmdSecretsShow(g, rest)
 	case "edit":
@@ -599,6 +604,97 @@ func cmdSecretsSet(g globals, args []string) int {
 	log := newLogger(g.jsonLog)
 	if err := admin.SecretsSet(ctx, h, *repoName, env, stack, plaintext, log); err != nil {
 		log.Error("secrets set failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdSecretsSetKey(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets set-key", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets set-key <env> <stack> <KEY> [<value>] [--repo <name>]")
+		fmt.Fprintln(os.Stderr, "  Sets a single KEY in the stack's secrets, leaving the others untouched.")
+		fmt.Fprintln(os.Stderr, "  With no <value> (or \"-\"), the value is read from stdin.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack, key := arg(pos, 0), arg(pos, 1), arg(pos, 2)
+	if env == "" || stack == "" || key == "" {
+		fs.Usage()
+		return 2
+	}
+	value := arg(pos, 3)
+	if value == "" || value == "-" {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: read stdin:", err)
+			return 1
+		}
+		value = strings.TrimRight(string(raw), "\n")
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.SecretSetKey(ctx, h, *repoName, env, stack, key, value, log); err != nil {
+		log.Error("secrets set-key failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdSecretsSetFile(g globals, args []string) int {
+	fs := flag.NewFlagSet("secrets set-file", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets set-file <env> <name> [<source>] [--repo <name>]")
+		fmt.Fprintln(os.Stderr, "  Encrypts a file secret's blob for the nodes declared in env.yml.")
+		fmt.Fprintln(os.Stderr, "  <source> is @<path> to read a file, or omitted/\"-\" to read stdin.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, name := arg(pos, 0), arg(pos, 1)
+	if env == "" || name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	var blob []byte
+	source := arg(pos, 2)
+	if strings.HasPrefix(source, "@") {
+		blob, err = os.ReadFile(strings.TrimPrefix(source, "@"))
+	} else {
+		blob, err = io.ReadAll(os.Stdin)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: read secret source:", err)
+		return 1
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.SecretSetFile(ctx, h, *repoName, env, name, blob, log); err != nil {
+		log.Error("secrets set-file failed", "error", err)
 		return 1
 	}
 	return 0
@@ -779,10 +875,16 @@ Commands:
                     --repo <name>   which repo's inventory (default: the sole one)
   secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
                                secrets for an environment's stack
+  secrets set-key <env> <stack> <KEY> [value]
+                               Set a single KEY in a stack's secrets (stdin if
+                               no value given)
+  secrets set-file <env> <name> [@path]
+                               Encrypt a declared file secret's blob (stdin, or
+                               @path to read a file) for its target nodes
   secrets show <env> <stack>   Decrypt and print an environment's stack secrets
   secrets edit <env> <stack>   Edit an environment's stack secrets in $EDITOR
-  secrets rekey <env>          Re-encrypt an environment's secrets for the
-                               current recipient set
+  secrets rekey <env>          Re-encrypt an environment's secrets (KV and file)
+                               for the current recipient set
   version           Print version
   help              Show this help
 

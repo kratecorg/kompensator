@@ -573,6 +573,12 @@ func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, 
 		}
 		changed = append(changed, filepath.Join("environments", env, "secrets", e.Name()))
 	}
+	fileChanged, err := rekeyEnvFiles(log, dest, home, env)
+	if err != nil {
+		return err
+	}
+	changed = append(changed, fileChanged...)
+
 	if len(changed) == 0 {
 		log.Info("no secrets to rekey", "env", env)
 		return nil
@@ -583,6 +589,60 @@ func rekeyEnv(ctx context.Context, log *slog.Logger, r config.Repo, dest, home, 
 	}
 	log.Info("secrets rekeyed", "env", env, "files", len(changed))
 	return nil
+}
+
+// rekeyEnvFiles re-encrypts every file secret blob of an environment for its
+// current recipient set, returning the repo-relative paths it rewrote (to be
+// committed by the caller). A blob whose declaration has been removed from
+// env.yml is skipped with a warning rather than failing the whole rekey.
+func rekeyEnvFiles(log *slog.Logger, dest, home, env string) ([]string, error) {
+	dir := repo.SecretsFilesDir(dest, env)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	e, err := repo.LoadEnvironment(dest, env)
+	if err != nil {
+		return nil, err
+	}
+
+	var changed []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".age") {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), ".age")
+		declaration, ok := e.Secret(name)
+		if !ok {
+			log.Warn("file secret blob has no declaration, skipping rekey", "env", env, "secret", name)
+			continue
+		}
+		recipients, err := envSecretRecipients(home, dest, e, declaration)
+		if err != nil {
+			return nil, err
+		}
+		full := filepath.Join(dir, entry.Name())
+		cipher, err := os.ReadFile(full)
+		if err != nil {
+			return nil, err
+		}
+		plaintext, err := secrets.Decrypt(secrets.KeyPath(home), cipher)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt %s: %w", entry.Name(), err)
+		}
+		reencrypted, err := secrets.Encrypt(recipients, plaintext)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(full, reencrypted, 0o644); err != nil {
+			return nil, err
+		}
+		changed = append(changed, filepath.Join("environments", env, "secrets", "files", entry.Name()))
+	}
+	return changed, nil
 }
 
 // writeSecrets encrypts values for the env's recipients and writes + pushes the
@@ -610,6 +670,109 @@ func writeSecrets(ctx context.Context, log *slog.Logger, r config.Repo, dest, ho
 	}
 	log.Info("secrets updated", "env", env, "stack", stack, "keys", len(values), "recipients", len(recipients))
 	return nil
+}
+
+// SecretSetKey sets (or adds) a single KEY: value entry in an environment's
+// stack secrets, leaving every other key untouched. It loads and decrypts the
+// existing map (an absent file starts empty), replaces the one key, and
+// re-encrypts + pushes for the stack's current recipients.
+func SecretSetKey(ctx context.Context, home, repoName, env, stack, key, value string, log *slog.Logger) error {
+	log = logger(log)
+	if env == "" || stack == "" || key == "" {
+		return fmt.Errorf("secrets set-key requires an env, a stack and a key")
+	}
+	r, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return err
+	}
+	values := map[string]string{}
+	if data, err := os.ReadFile(repo.SecretsFile(dest, env, stack)); err == nil {
+		if values, err = secrets.DecryptMap(secrets.KeyPath(home), data); err != nil {
+			return fmt.Errorf("decrypt existing secrets: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if values == nil {
+		values = map[string]string{}
+	}
+	values[key] = value
+	return writeSecrets(ctx, log, r, dest, home, env, stack, values)
+}
+
+// SecretSetFile encrypts a file secret's blob for its declared recipients and
+// writes it to environments/<env>/secrets/files/<name>.age (commit + push). The
+// secret must already be declared in env.yml; writing an undeclared blob is
+// rejected so an orphan file (that no node would ever materialise) never lands
+// in the repo.
+func SecretSetFile(ctx context.Context, home, repoName, env, name string, blob []byte, log *slog.Logger) error {
+	log = logger(log)
+	if env == "" || name == "" {
+		return fmt.Errorf("secrets set-file requires an env and a secret name")
+	}
+	r, dest, err := syncedRepo(ctx, home, repoName)
+	if err != nil {
+		return err
+	}
+	e, err := repo.LoadEnvironment(dest, env)
+	if err != nil {
+		return err
+	}
+	declaration, ok := e.Secret(name)
+	if !ok {
+		return fmt.Errorf("env %q declares no secret %q; add it to env.yml first", env, name)
+	}
+	if err := declaration.Validate(); err != nil {
+		return err
+	}
+	recipients, err := envSecretRecipients(home, dest, e, declaration)
+	if err != nil {
+		return err
+	}
+	cipher, err := secrets.Encrypt(recipients, blob)
+	if err != nil {
+		return err
+	}
+	rel := filepath.Join("environments", env, "secrets", "files", name+".age")
+	full := repo.SecretFileBlob(dest, env, name)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(full, cipher, 0o644); err != nil {
+		return err
+	}
+	msg := fmt.Sprintf("secrets: update file %s/%s", env, name)
+	if err := gitsync.CommitPush(ctx, dest, r.Branch, msg, rel); err != nil {
+		return err
+	}
+	log.Info("file secret updated", "env", env, "secret", name, "bytes", len(blob), "recipients", len(recipients))
+	return nil
+}
+
+// envSecretRecipients returns the age recipients a file secret is encrypted
+// for: the controller's own identity (so it can rekey later) plus the nodes the
+// secret targets. An unpinned secret uses every node of the environment; a
+// pinned one only the nodes in its list.
+func envSecretRecipients(home, dest string, e repo.Environment, s repo.EnvSecret) ([]string, error) {
+	controllerRecipient, created, err := secrets.LoadOrCreateIdentity(home)
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		slog.Default().Info("created controller age identity", "recipient", controllerRecipient)
+	}
+	inv, err := repo.LoadInventory(dest)
+	if err != nil {
+		return nil, err
+	}
+	var nodes []string
+	if len(s.Nodes) == 0 {
+		nodes = e.ParticipatingNodes(inv.AllNodeNames())
+	} else {
+		nodes = []string(s.Nodes)
+	}
+	recipients := append([]string{controllerRecipient}, inv.RecipientsForNodes(nodes)...)
+	return dedupeStrings(recipients), nil
 }
 
 // stackRecipients returns the age recipients a stack's secrets are encrypted

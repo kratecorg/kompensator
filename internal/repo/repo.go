@@ -204,6 +204,11 @@ type Environment struct {
 	// the others reach it across the WireGuard mesh). Only the entry for the
 	// reconciling node applies; the built-ins still win over everything.
 	NodeVariables map[string]map[string]string `yaml:"nodeVariables,omitempty"`
+	// Secrets are environment-scoped file secrets: opaque, age-encrypted blobs
+	// (e.g. a TLS certificate bundle) that kompensator materialises to a host
+	// path on the nodes that need them, out of band from the compose env-var
+	// secrets. See EnvSecret for the declaration and materialisation model.
+	Secrets []EnvSecret `yaml:"secrets,omitempty"`
 }
 
 // NodeVars returns the per-node variable overrides for the named node, or nil

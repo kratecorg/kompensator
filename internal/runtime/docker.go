@@ -381,6 +381,52 @@ func Deploy(ctx context.Context, composeFile, project string, labels Labels, ext
 	return nil
 }
 
+// ManagedContainerNames returns the real docker container names of a
+// kompensator-managed project, identified by the kompensator identity labels
+// (not the compose project name, which changes across Blue/Green colors). It is
+// used to resolve a reload hook's {{container:<stack>/<project>}} token to the
+// container(s) a command must act on. host is the docker "-H" endpoint ("" =
+// local daemon).
+func ManagedContainerNames(ctx context.Context, host, env, stack, project string) ([]string, error) {
+	args := []string{"ps", "--filter", "label=" + LabelManaged + "=true"}
+	if env != "" {
+		args = append(args, "--filter", "label="+LabelEnv+"="+env)
+	}
+	if stack != "" {
+		args = append(args, "--filter", "label="+LabelStack+"="+stack)
+	}
+	if project != "" {
+		args = append(args, "--filter", "label="+LabelProject+"="+project)
+	}
+	args = append(args, "--format", "{{.Names}}")
+	out, err := output(ctx, "docker", dockerArgs(host, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w: %s", err, out)
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// RunCommand runs an arbitrary command on the node, streaming its output to
+// stderr. It executes a secret reload hook authored in the deploy repo (e.g. a
+// live `docker exec <container> kill -HUP 1`). The command is operator-authored
+// config, trusted at the same level as the repo's compose files.
+func RunCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("empty reload command")
+	}
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // composeServices returns the service names a compose file defines, resolved
 // with the deploy env so variable-interpolated and profile-gated files list
 // exactly the services `up` will create. It is the set a label override must
