@@ -1,6 +1,52 @@
 package repo
 
-import "testing"
+import (
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// The declaration syntax is part of the contract with the deployment repo, so it
+// is asserted against literal YAML rather than a hand-built struct.
+func TestManagedFileDecodesFromEnvironmentYAML(t *testing.T) {
+	const document = `
+name: preprod
+files:
+  - name: pg-primary
+    variable: PG_PRIMARY_NODE
+    stack: carimco
+    nodes:
+      - customer05
+      - customer06
+    path: /home/peter/carimco/db/primary-node
+    reload:
+      command: [docker, exec, "{{container:carimco/dbproxy}}", /usr/local/bin/pgbouncer-set-primary.sh]
+`
+	var env Environment
+	if err := yaml.Unmarshal([]byte(document), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(env.Files) != 1 {
+		t.Fatalf("got %d files, want 1", len(env.Files))
+	}
+
+	file := env.Files[0]
+	if err := file.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if file.Variable != "PG_PRIMARY_NODE" || file.Stack != "carimco" {
+		t.Fatalf("got variable %q, stack %q", file.Variable, file.Stack)
+	}
+	if file.Path != "/home/peter/carimco/db/primary-node" {
+		t.Fatalf("got path %q", file.Path)
+	}
+	if !file.TargetsNode("customer06") || file.TargetsNode("customer02") {
+		t.Fatal("node pin was not decoded")
+	}
+	if file.Reload == nil || len(file.Reload.Command) != 4 {
+		t.Fatalf("reload command was not decoded: %+v", file.Reload)
+	}
+}
 
 // envWithStackVariable mirrors how a switchover topology is declared: the value
 // lives on the stack placement, not env-wide, because two projects of that one
