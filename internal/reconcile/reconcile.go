@@ -77,6 +77,17 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 	defer unlock()
 
+	// Checked while holding the lock, not before: an operator who observes an
+	// idle lock after setting the marker can then be sure no run is about to
+	// start with a stale view of the pause.
+	paused, err := isPaused(log, opts.Home)
+	if err != nil {
+		return Result{}, err
+	}
+	if paused {
+		return Result{}, nil
+	}
+
 	envs := []string{opts.Env}
 	if opts.Env == "" {
 		envs, err = resolveEnvs(ctx, log, opts, cfg)

@@ -53,6 +53,10 @@ func main() {
 	switch cmd {
 	case "reconcile":
 		os.Exit(cmdReconcile(g, rest))
+	case "pause":
+		os.Exit(cmdPause(g, rest))
+	case "resume":
+		os.Exit(cmdResume(g, rest))
 	case "status":
 		os.Exit(cmdStatus(g, rest))
 	case "verify":
@@ -123,6 +127,80 @@ func cmdReconcile(g globals, args []string) int {
 	return 0
 }
 
+// cmdPause suspends reconciling on this home until resumed or until the pause
+// expires. It exists so an operation that must not be interrupted — a database
+// switchover, for instance — can keep the cron tick out through a declared
+// interface instead of by holding kompensator's run lock from outside.
+func cmdPause(g globals, args []string) int {
+	fs := flag.NewFlagSet("pause", flag.ContinueOnError)
+	reason := fs.String("reason", "", "why reconciling is suspended (shown in status and in the reconcile log)")
+	timeout := fs.Duration("timeout", 0, "lift the pause automatically after this long; 0 means until resumed")
+	wait := fs.Duration("wait", 0, "wait this long for a reconcile already in progress to finish")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] pause [--reason <text>] [--timeout <d>] [--wait <d>]")
+		fs.PrintDefaults()
+	}
+	if _, err := parseFlagsAndArgs(fs, args); err != nil {
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	p, err := reconcile.SetPause(h, *reason, *timeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	fmt.Println("paused:", p.Describe(time.Now()))
+
+	// The marker alone only keeps later runs out. Waiting for the lock proves
+	// that no run is still underway, which is what a caller needs before it
+	// starts changing things.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := reconcile.WaitForIdle(ctx, h, *wait); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, "the pause is set; run 'kompensator resume' if you are not going ahead")
+		return 1
+	}
+	fmt.Println("no reconcile in progress")
+	return 0
+}
+
+// cmdResume lifts a pause. Resuming a home that is not paused is not an error,
+// so it can be repeated after an operation that failed halfway.
+func cmdResume(g globals, args []string) int {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] resume")
+	}
+	if _, err := parseFlagsAndArgs(fs, args); err != nil {
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	lifted, err := reconcile.ClearPause(h)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if !lifted {
+		fmt.Println("not paused")
+		return 0
+	}
+	fmt.Println("resumed")
+	return 0
+}
+
 func cmdStatus(g globals, args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	repoName := fs.String("repo", "", "limit to this repo (default: all configured repos)")
@@ -148,6 +226,15 @@ func cmdStatus(g globals, args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// A pause that nobody lifted looks exactly like a healthy node otherwise:
+	// nothing drifts because nothing is deployed. It has to be visible here.
+	if p, found, err := reconcile.ReadPause(h); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	} else if found && !p.IsExpired(time.Now()) {
+		fmt.Printf("RECONCILING IS PAUSED: %s\n\n", p.Describe(time.Now()))
+	}
 
 	statuses, err := reconcile.Status(ctx, reconcile.Options{Home: h, Env: env, Repo: *repoName})
 	if err != nil {
@@ -854,6 +941,12 @@ Commands:
                     --repo <name>   limit to one repo (default: all)
   status [env]      Show target vs. running images; no env shows all
                     environments. --repo <name> limits to one repo
+  pause             Suspend reconciling on this home, so a delicate operation
+                    is not interrupted by a cron tick
+                    --reason <text> shown in status and in the reconcile log
+                    --timeout <d>   lift automatically after this long
+                    --wait <d>      wait for a run already in progress
+  resume            Lift a pause
   verify <env>      Check, from git, that every node hosting the env has
                     reconciled the desired commit and is healthy
                     --commit <sha>  desired commit (default: deploy branch tip)
@@ -893,6 +986,8 @@ Examples:
   kompensator reconcile dev
   kompensator -json reconcile dev
   kompensator status
+  kompensator pause --reason 'db switchover' --timeout 15m --wait 2m
+  kompensator resume
   kompensator -home /opt/controller controller init
   kompensator -home /opt/controller controller repo add prod ssh://git@example.org/org/deploy.git
   kompensator -home /opt/controller bootstrap --name node7 --location ssh://peter@host.example.org
