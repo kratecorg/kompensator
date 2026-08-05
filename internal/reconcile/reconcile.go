@@ -604,6 +604,9 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 	if err := materializeFileSecrets(ctx, log, names, opts, repoRoot, env); err != nil {
 		return res, fmt.Errorf("env %q file secrets: %w", opts.Env, err)
 	}
+	if err := materializeManagedFiles(ctx, log, names, opts, env); err != nil {
+		return res, fmt.Errorf("env %q managed files: %w", opts.Env, err)
+	}
 
 	for _, placement := range env.Stacks {
 		stackName := placement.Name
@@ -870,6 +873,33 @@ func writeSecretHash(home, env, name, hash string) error {
 		d.Secrets = map[string]string{}
 	}
 	d.Secrets[name] = hash
+	return d.save(home, env)
+}
+
+// readFileHash returns the content hash of the managed file last written on
+// this node, or "" when it has never been written.
+func readFileHash(home, env, name string) string {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
+		return ""
+	}
+	return d.Files[name]
+}
+
+// writeFileHash records the content hash of a just-written managed file,
+// leaving every other field of the status document untouched.
+func writeFileHash(home, env, name, hash string) error {
+	d, err := loadStatusDoc(home, env)
+	if err != nil {
+		return err
+	}
+	if d.Env == "" {
+		d.Env = env
+	}
+	if d.Files == nil {
+		d.Files = map[string]string{}
+	}
+	d.Files[name] = hash
 	return d.save(home, env)
 }
 

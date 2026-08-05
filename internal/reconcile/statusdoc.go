@@ -35,6 +35,9 @@ type statusDoc struct {
 	// this node, keyed by secret name. It drives change detection: a secret whose
 	// hash still matches is already on disk and its reload hook is not re-run.
 	Secrets map[string]string `yaml:"secrets,omitempty"`
+	// Files records the same for managed files, kept in its own map so a file and
+	// a secret may share a name without shadowing each other.
+	Files map[string]string `yaml:"files,omitempty"`
 }
 
 // projectStatus is the recorded state of one project, keyed in the document by

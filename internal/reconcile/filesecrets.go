@@ -72,30 +72,30 @@ func materializeFileSecret(ctx context.Context, log *slog.Logger, names runtime.
 		return nil
 	}
 
-	if err := writeSecretFile(secret, plaintext); err != nil {
+	mode, err := secret.FileMode()
+	if err != nil {
+		return err
+	}
+	if err := writeNodeFile(secret.File.Path, mode, plaintext); err != nil {
 		return err
 	}
 	l.Info("file secret materialised", "path", secret.File.Path, "bytes", len(plaintext))
 
-	if err := runSecretReload(ctx, l, opts, secret); err != nil {
+	if err := runReload(ctx, l, opts, secret.Reload); err != nil {
 		return fmt.Errorf("reload: %w", err)
 	}
 	return writeSecretHash(opts.Home, opts.Env, secret.Name, hash)
 }
 
-// writeSecretFile writes content to the secret's host path atomically (temp
-// file + rename) with the declared mode, so a consumer never observes a
-// half-written file and the permission is applied before the file is visible.
-func writeSecretFile(secret repo.EnvSecret, content []byte) error {
-	mode, err := secret.FileMode()
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(secret.File.Path)
+// writeNodeFile writes content to a host path atomically (temp file + rename)
+// with the given mode, so a consumer never observes a half-written file and the
+// permission is applied before the file is visible.
+func writeNodeFile(path string, mode os.FileMode, content []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".kompensator-secret-*")
+	tmp, err := os.CreateTemp(dir, ".kompensator-*")
 	if err != nil {
 		return err
 	}
@@ -113,33 +113,33 @@ func writeSecretFile(secret repo.EnvSecret, content []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, secret.File.Path); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
 	return nil
 }
 
-// runSecretReload runs the reload action declared for a changed secret. A
-// "recreate" target is realised by invalidating the project's deploy
-// fingerprint so the following deploy pass recreates it; a "command" is run
-// directly on the node. A secret without a reload block needs no action.
-func runSecretReload(ctx context.Context, log *slog.Logger, opts Options, secret repo.EnvSecret) error {
-	if secret.Reload == nil {
+// runReload runs the reload action declared for changed content. A "recreate"
+// target is realised by invalidating the project's deploy fingerprint so the
+// following deploy pass recreates it; a "command" is run directly on the node.
+// A declaration without a reload block needs no action.
+func runReload(ctx context.Context, log *slog.Logger, opts Options, reload *repo.SecretReload) error {
+	if reload == nil {
 		return nil
 	}
-	if secret.Reload.Recreate != "" {
-		stack, project, err := splitStackProject(secret.Reload.Recreate)
+	if reload.Recreate != "" {
+		stack, project, err := splitStackProject(reload.Recreate)
 		if err != nil {
 			return err
 		}
-		log.Info("secret changed, marking project for recreate", "target", secret.Reload.Recreate)
+		log.Info("content changed, marking project for recreate", "target", reload.Recreate)
 		return invalidateDeployHash(opts.Home, opts.Env, stack, project)
 	}
-	if len(secret.Reload.Command) == 0 {
+	if len(reload.Command) == 0 {
 		return nil
 	}
-	return runReloadCommand(ctx, log, opts, secret.Reload.Command)
+	return runReloadCommand(ctx, log, opts, reload.Command)
 }
 
 // runReloadCommand runs a reload command, expanding a {{container:...}} token to
@@ -150,7 +150,7 @@ func runSecretReload(ctx context.Context, log *slog.Logger, opts Options, secret
 func runReloadCommand(ctx context.Context, log *slog.Logger, opts Options, command []string) error {
 	ref, hasToken := containerRef(command)
 	if !hasToken {
-		log.Info("running secret reload command")
+		log.Info("running reload command")
 		return runtime.RunCommand(ctx, command)
 	}
 	stack, project, err := splitStackProject(ref)
@@ -166,7 +166,7 @@ func runReloadCommand(ctx context.Context, log *slog.Logger, opts Options, comma
 		return nil
 	}
 	for _, container := range containers {
-		log.Info("running secret reload command", "container", container)
+		log.Info("running reload command", "container", container)
 		if err := runtime.RunCommand(ctx, expandContainerToken(command, container)); err != nil {
 			return err
 		}

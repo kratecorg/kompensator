@@ -209,6 +209,11 @@ type Environment struct {
 	// path on the nodes that need them, out of band from the compose env-var
 	// secrets. See EnvSecret for the declaration and materialisation model.
 	Secrets []EnvSecret `yaml:"secrets,omitempty"`
+	// Files are environment-scoped managed files: a single declared variable
+	// delivered to a host path instead of (or alongside) a compose environment
+	// variable, so a consumer can reload on change rather than be recreated. See
+	// ManagedFile.
+	Files []ManagedFile `yaml:"files,omitempty"`
 }
 
 // NodeVars returns the per-node variable overrides for the named node, or nil
