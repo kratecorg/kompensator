@@ -87,20 +87,38 @@ func cmdReconcile(g globals, args []string) int {
 	force := fs.Bool("force", false, "redeploy even when the desired image is already running")
 	prune := fs.Bool("prune", false, "tear down kompensator-managed containers no longer placed here (containers only; volumes are left intact)")
 	repoName := fs.String("repo", "", "limit to this repo (default: all configured repos)")
+	ignorePause := fs.Bool("ignore-pause", false, "run even while this home is paused; the pause itself is left in place")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] [--prune] [--repo <name>] [<env>]")
-		fmt.Fprintln(os.Stderr, "  Omitting <env> reconciles every environment.")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] reconcile [--force] [--prune] [--ignore-pause] [--repo <name>] [<env> [<stack> [<project>]]]")
+		fmt.Fprintln(os.Stderr, "  Each argument narrows the run: no <env> reconciles every environment,")
+		fmt.Fprintln(os.Stderr, "  <stack> only that stack, <project> only that project of it.")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
 	if err != nil {
 		return 2
 	}
-	if len(pos) > 1 {
+	if len(pos) > 3 {
 		fs.Usage()
 		return 2
 	}
-	env := arg(pos, 0)
+	env, stack, project := arg(pos, 0), arg(pos, 1), arg(pos, 2)
+	if stack != "" && env == "" {
+		fmt.Fprintln(os.Stderr, "error: <stack> needs an <env> in front of it")
+		return 2
+	}
+	if project != "" && stack == "" {
+		fmt.Fprintln(os.Stderr, "error: <project> needs a <stack> in front of it")
+		return 2
+	}
+	// Prune is the one part of a reconcile that ignores the narrowing: it tears
+	// down every managed project the desired state no longer places on this node,
+	// across all stacks. A run that promised to touch one stack cannot also do
+	// that.
+	if *prune && stack != "" {
+		fmt.Fprintln(os.Stderr, "error: --prune acts on the whole environment and cannot be combined with <stack>/<project>")
+		return 2
+	}
 
 	h, err := resolveHome(g.home)
 	if err != nil {
@@ -113,13 +131,16 @@ func cmdReconcile(g globals, args []string) int {
 
 	log := newLogger(g.jsonLog)
 	if _, err := reconcile.Run(ctx, reconcile.Options{
-		Home:    h,
-		Env:     env,
-		Repo:    *repoName,
-		Force:   *force,
-		Prune:   *prune,
-		JSONLog: g.jsonLog,
-		Logger:  log,
+		Home:        h,
+		Env:         env,
+		Repo:        *repoName,
+		Stack:       stack,
+		Project:     project,
+		Force:       *force,
+		Prune:       *prune,
+		IgnorePause: *ignorePause,
+		JSONLog:     g.jsonLog,
+		Logger:      log,
 	}); err != nil {
 		log.Error("reconcile failed", "error", err)
 		return 1
@@ -935,9 +956,12 @@ repos and drives the nodes) or a node (node.yml, follows one repo and reconciles
 itself). The role is detected from which config the home holds.
 
 Commands:
-  reconcile [env]   Pull deployment repo(s) and deploy on drift; no env
-                    reconciles every environment
+  reconcile [env [stack [project]]]
+                    Pull deployment repo(s) and deploy on drift; each argument
+                    narrows the run, no env reconciles every environment. A
+                    narrowed run neither prunes nor rewrites the env status
                     --force         redeploy even when already in sync
+                    --ignore-pause  run despite a pause, without lifting it
                     --repo <name>   limit to one repo (default: all)
   status [env]      Show target vs. running images; no env shows all
                     environments. --repo <name> limits to one repo

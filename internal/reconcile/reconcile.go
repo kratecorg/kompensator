@@ -32,10 +32,35 @@ type Options struct {
 	Home    string
 	Env     string // empty means: every environment (in the selected repos)
 	Repo    string // empty means: every configured repo; else only this repo
+	Stack   string // empty means: every stack the env places here; else only this one
+	Project string // empty means: every project of the selected stack; else only this one
 	Force   bool   // redeploy even when the desired images are already running
 	Prune   bool   // tear down kompensator-managed containers no longer placed here
-	JSONLog bool   // pass -json through to node agents (controller mode)
+
+	// IgnorePause runs even while this home is paused. The pause keeps the cron
+	// tick out of a change an operator is driving by hand; a step of that very
+	// change must still be able to act, and says so explicitly rather than
+	// lifting the pause and racing the scheduler for the rest of the operation.
+	IgnorePause bool
+
+	JSONLog bool // pass -json through to node agents (controller mode)
 	Logger  *slog.Logger
+}
+
+// isNarrowed reports whether the run was restricted to a part of the
+// environment. Such a run promises to touch only what it was named, which is
+// why it neither prunes nor rewrites the environment's status document: neither
+// statement would be true of the environment as a whole.
+func (o Options) isNarrowed() bool {
+	return o.Stack != ""
+}
+
+// describeScope names a run's narrowing arguments for an error message.
+func describeScope(opts Options) string {
+	if opts.Project != "" {
+		return fmt.Sprintf("project %q of stack %q", opts.Project, opts.Stack)
+	}
+	return fmt.Sprintf("stack %q", opts.Stack)
 }
 
 // Result summarises a reconcile run, counted per project.
@@ -53,7 +78,8 @@ type Result struct {
 // locally by re-executing itself with the node's home, or remotely over ssh.
 //
 // When opts.Env is empty it reconciles every environment found in the selected
-// repos; when opts.Repo is empty it acts on every configured repo. The home
+// repos; when opts.Repo is empty it acts on every configured repo. opts.Stack
+// and opts.Project narrow the run further, down to a single project. The home
 // lock is held for the whole run so all environments reconcile atomically with
 // respect to other runs.
 func Run(ctx context.Context, opts Options) (Result, error) {
@@ -84,8 +110,11 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if paused {
+	if paused && !opts.IgnorePause {
 		return Result{}, nil
+	}
+	if paused {
+		log.Info("home is paused, running anyway on request", "env", opts.Env)
 	}
 
 	envs := []string{opts.Env}
@@ -176,6 +205,7 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 	}
 
 	var total Result
+	scopeFound := false
 	for _, r := range repos {
 		dest := filepath.Join(config.ReposDir(opts.Home), r.Name)
 		commit, err := gitsync.Sync(ctx, r.URL, r.Branch, dest)
@@ -188,8 +218,21 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 			Repo: r.Name, Node: cfg.NodeName,
 			IncludeRepo: cfg.Naming.UseRepo(), IncludeNode: cfg.Naming.UseNode(),
 		}
-		res, rerr := reconcileRepo(ctx, log, names, opts, dest)
+		res, found, rerr := reconcileRepo(ctx, log, names, opts, dest)
 		total.add(res)
+		scopeFound = scopeFound || found
+
+		// A narrowed run looked at one part of the environment. Pruning would tear
+		// down projects it never considered, and the status document would record a
+		// convergence of the whole environment that was never attempted — the very
+		// two statements a pipeline reads. Both are left as the last full run wrote
+		// them.
+		if opts.isNarrowed() {
+			if rerr != nil {
+				return total, fmt.Errorf("reconcile repo %q: %w", r.Name, rerr)
+			}
+			continue
+		}
 
 		// Prune runs after convergence so a Blue/Green switch has already stopped
 		// the idle color; only whole projects the desired state no longer places
@@ -210,6 +253,12 @@ func runNode(ctx context.Context, log *slog.Logger, opts Options, cfg *config.Co
 		if rerr != nil {
 			return total, fmt.Errorf("reconcile repo %q: %w", r.Name, rerr)
 		}
+	}
+
+	// A narrowing argument that named nothing is a typo, not a no-op: reporting
+	// success here would tell an operator their surgical step ran when it did not.
+	if opts.isNarrowed() && !scopeFound {
+		return total, fmt.Errorf("%s is not declared in env %q", describeScope(opts), opts.Env)
 	}
 
 	log.Info("reconcile finished",
@@ -545,7 +594,16 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 	if opts.Prune {
 		sub = append(sub, "--prune")
 	}
+	if opts.IgnorePause {
+		sub = append(sub, "--ignore-pause")
+	}
 	sub = append(sub, opts.Env)
+	if opts.Stack != "" {
+		sub = append(sub, opts.Stack)
+	}
+	if opts.Project != "" {
+		sub = append(sub, opts.Project)
+	}
 
 	var cmd *exec.Cmd
 	if loc.Local {
@@ -573,43 +631,58 @@ func triggerReconcile(ctx context.Context, loc repo.Location, opts Options) erro
 	return cmd.Run()
 }
 
-// reconcileRepo reconciles every stack placed in the environment for this repo.
-func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot string) (Result, error) {
+// reconcileRepo reconciles the stacks this environment places on the node,
+// narrowed to opts.Stack and opts.Project when they are set. The bool reports
+// whether the narrowing named a stack this repo declares, so the caller can
+// tell a typo apart from a repo that simply does not define the environment.
+func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, repoRoot string) (Result, bool, error) {
 	var res Result
 
 	env, err := repo.LoadEnvironment(repoRoot, opts.Env)
 	if err != nil {
 		// This repo does not define the environment; nothing to do here.
 		log.Info("env not defined in this repo, skipping repo", "repo", repoRoot, "env", opts.Env)
-		return res, nil
+		return res, false, nil
 	}
 	if !env.RunsOnNode(names.Node) {
 		log.Info("node runs no stack of this env, skipping repo", "repo", repoRoot, "node", names.Node)
-		return res, nil
+		return res, false, nil
 	}
 	if len(env.Stacks) == 0 {
 		log.Info("env hosts no stacks")
-		return res, nil
+		return res, false, nil
 	}
 
 	// Phase 0: create the environment's shared networks/volumes before any stack
 	// deploys, so no project has to own a cross-stack resource.
 	if err := ensureResources(ctx, log, names, opts.Env, "", env.Networks, env.Volumes); err != nil {
-		return res, fmt.Errorf("env %q resources: %w", opts.Env, err)
+		return res, false, fmt.Errorf("env %q resources: %w", opts.Env, err)
 	}
 
 	// Phase 0b: materialise file secrets before any project deploys, so a bind-
 	// mounted secret is on disk when its consumer starts and a "recreate" reload
-	// can invalidate the consumer's fingerprint ahead of the deploy loop.
+	// can invalidate the consumer's fingerprint ahead of the deploy loop. This
+	// runs for a narrowed run too: delivering a declared value to a consumer that
+	// can reread it is what lets an operator repoint a running container without
+	// deploying anything around it.
 	if err := materializeFileSecrets(ctx, log, names, opts, repoRoot, env); err != nil {
-		return res, fmt.Errorf("env %q file secrets: %w", opts.Env, err)
+		return res, false, fmt.Errorf("env %q file secrets: %w", opts.Env, err)
 	}
 	if err := materializeManagedFiles(ctx, log, names, opts, env); err != nil {
-		return res, fmt.Errorf("env %q managed files: %w", opts.Env, err)
+		return res, false, fmt.Errorf("env %q managed files: %w", opts.Env, err)
 	}
 
+	scopeFound := false
 	for _, placement := range env.Stacks {
 		stackName := placement.Name
+		if opts.Stack != "" {
+			if stackName != opts.Stack {
+				continue
+			}
+			// Recorded on the declaration, not on the placement: a stack that this
+			// node does not host is a legitimate no-op, not a mistyped argument.
+			scopeFound = true
+		}
 		if !placement.StackRunsOn(names.Node) {
 			log.Info("stack not placed on this node, skipping", "stack", stackName, "node", names.Node)
 			continue
@@ -619,15 +692,18 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		// its projects deploy: the stack's managed proxy bind-mounts it (PROXY_DIR)
 		// and Blue/Green projects write color-switch files into it.
 		if err := os.MkdirAll(proxyDir(opts.Home, names.Repo, opts.Env, stackName), 0o755); err != nil {
-			return res, fmt.Errorf("create proxy dir: %w", err)
+			return res, scopeFound, fmt.Errorf("create proxy dir: %w", err)
 		}
 
 		stack, err := repo.LoadStack(repoRoot, stackName)
 		if err != nil {
-			return res, fmt.Errorf("stack %q: %w", stackName, err)
+			return res, scopeFound, fmt.Errorf("stack %q: %w", stackName, err)
+		}
+		if err := requireProject(stack, opts.Project); err != nil {
+			return res, scopeFound, fmt.Errorf("stack %q: %w", stackName, err)
 		}
 		if err := validateProxyBindings(stack); err != nil {
-			return res, err
+			return res, scopeFound, err
 		}
 		// A stack whose every project is pinned away from this node has nothing to
 		// run here — not even its managed proxy, which exists only to front the
@@ -642,11 +718,11 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		// its projects — or its managed proxy — deploy, so projects only ever join
 		// them as external and deploy order no longer encodes who owns a network.
 		if err := ensureResources(ctx, log, names, opts.Env, stackName, stack.Networks, stack.Volumes); err != nil {
-			return res, fmt.Errorf("stack %q resources: %w", stackName, err)
+			return res, scopeFound, fmt.Errorf("stack %q resources: %w", stackName, err)
 		}
 		state, err := repo.LoadStackState(repoRoot, opts.Env, stackName)
 		if err != nil {
-			return res, fmt.Errorf("stack %q: %w", stackName, err)
+			return res, scopeFound, fmt.Errorf("stack %q: %w", stackName, err)
 		}
 		// Variables resolve in nested scopes, broad to narrow, each layer
 		// overriding the previous (see repository-layout.md):
@@ -662,9 +738,12 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		}
 		secretVars, err := loadSecretVars(opts.Home, repoRoot, opts.Env, stackName)
 		if err != nil {
-			return res, fmt.Errorf("stack %q secrets: %w", stackName, err)
+			return res, scopeFound, fmt.Errorf("stack %q secrets: %w", stackName, err)
 		}
 		for _, p := range stack.Projects {
+			if opts.Project != "" && p.Name != opts.Project {
+				continue
+			}
 			if !placement.ProjectRunsOn(p.Name, names.Node) {
 				log.Info("project not placed on this node, skipping", "stack", stackName, "project", p.Name, "node", names.Node)
 				continue
@@ -680,15 +759,32 @@ func reconcileRepo(ctx context.Context, log *slog.Logger, names runtime.Names, o
 		}
 
 		// The stack's managed proxy is deployed last: it routes to the projects
-		// above, so they (and the network a project owns) must exist first.
-		if stack.Proxy != nil {
+		// above, so they (and the network a project owns) must exist first. A run
+		// narrowed to one project leaves it alone: the proxy is a project of its own
+		// and fronts siblings this run was told not to touch.
+		if stack.Proxy != nil && opts.Project == "" {
 			if err := reconcileManagedProxy(ctx, log, names, opts, stackName, *stack.Proxy, &res); err != nil {
 				log.Error("managed proxy reconcile failed", "stack", stackName, "proxy", stack.Proxy.Name, "error", err)
 				res.Failed++
 			}
 		}
 	}
-	return res, nil
+	return res, scopeFound, nil
+}
+
+// requireProject checks the stack declares the named project, so a mistyped
+// narrowing argument fails the run instead of quietly reconciling nothing. An
+// empty name selects the whole stack and always passes.
+func requireProject(stack repo.Stack, project string) error {
+	if project == "" {
+		return nil
+	}
+	for _, p := range stack.Projects {
+		if p.Name == project {
+			return nil
+		}
+	}
+	return fmt.Errorf("project %q not declared", project)
 }
 
 // ensureResources creates the docker networks and volumes declared on a stack

@@ -13,8 +13,15 @@ import (
 // path and runs each one's reload hook, but only for files whose content
 // changed. Like file secrets it runs before the stack deploy loop, so a newly
 // written file is in place when a project that bind-mounts it starts.
+//
+// A run narrowed to a stack delivers that stack's files and the environment's
+// own. A file declared for a different stack is left alone: its reload hook
+// would reach into a scope the run promised not to touch.
 func materializeManagedFiles(ctx context.Context, log *slog.Logger, names runtime.Names, opts Options, env repo.Environment) error {
 	for _, file := range env.Files {
+		if opts.Stack != "" && file.Stack != "" && file.Stack != opts.Stack {
+			continue
+		}
 		if err := materializeManagedFile(ctx, log, names, opts, env, file); err != nil {
 			return fmt.Errorf("managed file %q: %w", file.Name, err)
 		}
