@@ -768,19 +768,43 @@ func loadSecretVars(home, repoRoot, env, stack string) (map[string]string, error
 // environment (sorted KEY=value entries: variables, secrets and image refs).
 // Two deploys with the same fingerprint are equivalent. The secret values feed
 // the one-way hash only, so the fingerprint never leaks them.
-func computeConfigHash(composeFile string, extraEnv []string) (string, error) {
+//
+// "Effective" means: only the variables the compose file actually interpolates.
+// The deploy env holds every variable of the stack, but compose passes on just
+// the ones its model references, so a variable outside that set cannot reach a
+// container and must not force a recreate. That is what lets a stack-wide
+// variable steer kompensator itself — e.g. the source of a managed file — while
+// leaving unrelated projects untouched.
+func computeConfigHash(ctx context.Context, composeFile string, extraEnv []string) (string, error) {
 	data, err := os.ReadFile(composeFile)
+	if err != nil {
+		return "", err
+	}
+	used, err := runtime.ComposeVariables(ctx, composeFile, append(os.Environ(), extraEnv...))
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
 	h.Write(data)
 	h.Write([]byte{0})
-	for _, e := range extraEnv {
+	for _, e := range selectUsedEnv(extraEnv, used) {
 		h.Write([]byte(e))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// selectUsedEnv keeps the KEY=value entries whose key the compose model
+// references, preserving the caller's ordering.
+func selectUsedEnv(extraEnv []string, used map[string]bool) []string {
+	kept := make([]string, 0, len(extraEnv))
+	for _, e := range extraEnv {
+		key, _, found := strings.Cut(e, "=")
+		if found && used[key] {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 // proxyDir is the node-local directory a file-based reverse proxy watches for
@@ -928,7 +952,7 @@ func reconcileProject(ctx context.Context, log *slog.Logger, names runtime.Names
 	// (variables, secrets and image refs) into one fingerprint. It lets a
 	// reconcile detect changes that leave the image tags untouched — a changed
 	// variable, secret or compose file — which image comparison alone misses.
-	configHash, err := computeConfigHash(composeFile, extraEnv)
+	configHash, err := computeConfigHash(ctx, composeFile, extraEnv)
 	if err != nil {
 		return fmt.Errorf("config hash: %w", err)
 	}
@@ -1167,7 +1191,7 @@ func reconcileManagedProxy(ctx context.Context, log *slog.Logger, names runtime.
 
 	proj := names.Project(opts.Env, stack, project, "")
 	extraEnv := []string{"ENV_NAME=" + opts.Env}
-	configHash, err := computeConfigHash(composePath, extraEnv)
+	configHash, err := computeConfigHash(ctx, composePath, extraEnv)
 	if err != nil {
 		return fmt.Errorf("config hash: %w", err)
 	}

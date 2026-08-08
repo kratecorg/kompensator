@@ -283,9 +283,13 @@ flowchart TB
     Node -- "docker pull" --> Reg
 ```
 
-- **Nodes are pre-provisioned** out of band: Docker installed, Git installed,
-  registry login done (`docker login`), read-only Git deploy key in place.
-  kompensator assumes these prerequisites and validates them on `bootstrap`.
+- **Nodes are pre-provisioned** out of band: Docker installed (Compose plugin
+  **v2.26.0 or newer** — kompensator needs `docker compose config --variables`,
+  and deliberately carries no fallback for older versions, since a fallback
+  would make the same node deploy differently depending on its compose
+  version), Git installed, registry login done (`docker login`), read-only Git
+  deploy key in place. kompensator assumes these prerequisites and validates
+  them on `bootstrap`.
 - **Node-local config** lives under `~/.config/kompensator/` and holds only the node
   name and the deployment repo list — no secrets.
 - **SSH** is the only inbound channel to a node; key-based auth, no kompensator port.

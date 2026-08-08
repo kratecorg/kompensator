@@ -34,7 +34,9 @@ Compose. Traffic switching during a deployment is handled by a pluggable
 - **Source of truth:** Git. Each node clones/pulls its configured deployment repo(s) itself using a read-only deploy key.
 - **Node-local config:** Each node has its own config under `~/.config/kompensator/`
   holding the node **name** and the list of **deployment repos** it follows.
-- **Runtime:** Docker Compose.
+- **Runtime:** Docker Compose, **v2.26.0 or newer** on every node (kompensator uses
+  `docker compose config --variables` to fingerprint a deploy). No fallback for
+  older versions — a node either meets it or refuses to reconcile.
 - **Load balancing:** A **pluggable proxy interface**; the first plugin is
   `haproxy-local` (notifies a locally running HAProxy of a color switch).
 - **Topology:** Apps are placed on nodes via **labels/groups** (selectors).
@@ -46,7 +48,7 @@ Compose. Traffic switching during a deployment is handled by a pluggable
 - **Git pulls** use `git pull --rebase` (clean fast-forward; no jitter needed).
 - **Secrets:** placed **out of band** on the node — never committed to Git.
 - **Logging:** structured logs to **journald** (pick up via Loki etc.).
-- **Node prerequisites:** Nodes are pre-provisioned (Docker, Git, registry login, deploy key all present).
+- **Node prerequisites:** Nodes are pre-provisioned (Docker with Compose >= 2.26.0, Git, registry login, deploy key all present).
 
 ## Implementation phases (summary)
 

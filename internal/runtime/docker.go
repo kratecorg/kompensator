@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +27,12 @@ const (
 	LabelProject = "kompensator.project"
 	LabelColor   = "kompensator.color"
 )
+
+// MinComposeVersion is the oldest Docker Compose a node may run. It is set by
+// `docker compose config --variables`, which kompensator needs to tell the
+// variables a compose file actually uses from the rest of the deploy env (see
+// ComposeVariables). Everything else kompensator asks of compose is older.
+const MinComposeVersion = "2.26.0"
 
 // Labels is the kompensator identity applied to every service container of a
 // deploy. The managed marker is always set; Color is empty for recreate and
@@ -447,6 +454,44 @@ func composeServices(ctx context.Context, composeFile string, env []string) ([]s
 		}
 	}
 	return services, nil
+}
+
+// ComposeVariables returns the names of the environment variables a compose
+// file interpolates, following `include:` and `extends:` into the files they
+// pull in. Compose hands nothing else to the containers, so a variable outside
+// this set cannot influence the deploy however the process environment changes.
+// That makes the set the exact filter for a config fingerprint: the deploy env
+// carries every variable of a stack, but only these reach a container.
+//
+// The listing is a pure model inspection — compose does not interpolate here,
+// so variables declared required (${VAR:?}) do not have to be set. env is still
+// passed so file paths resolved while loading includes see the same values a
+// deploy would.
+//
+// `config --variables` landed in Docker Compose v2.26.0, which this makes
+// kompensator's minimum on every node. There is deliberately no fallback for
+// older versions: a fallback would have to hash the whole deploy env and would
+// therefore recreate containers a current node leaves alone — the same node
+// would behave differently depending on its compose version, which is worse
+// than refusing to run.
+func ComposeVariables(ctx context.Context, composeFile string, env []string) (map[string]bool, error) {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "config", "--variables", "--format", "json")
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("docker compose config --variables (%s): %w: %s (needs Docker Compose >= %s)", composeFile, err, strings.TrimSpace(stderr.String()), MinComposeVersion)
+	}
+	var declared map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &declared); err != nil {
+		return nil, fmt.Errorf("parse compose variables (%s): %w", composeFile, err)
+	}
+	used := make(map[string]bool, len(declared))
+	for name := range declared {
+		used[name] = true
+	}
+	return used, nil
 }
 
 // writeLabelOverride writes a compose override file that stamps the kompensator
