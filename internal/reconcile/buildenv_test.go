@@ -4,8 +4,8 @@ import (
 	"slices"
 	"testing"
 
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
 )
 
 // TestBuildEnvExcludesOneShotFromRefs verifies that a one-shot job service is

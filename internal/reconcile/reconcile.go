@@ -15,12 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"kompensator/internal/config"
-	"kompensator/internal/gitsync"
-	"kompensator/internal/proxy"
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
-	"kompensator/internal/secrets"
+	"github.com/kratecorg/kompensator/internal/config"
+	"github.com/kratecorg/kompensator/internal/gitsync"
+	"github.com/kratecorg/kompensator/internal/proxy"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/secrets"
 )
 
 // healthTimeout bounds how long a deploy waits for new containers to become
@@ -374,7 +374,7 @@ const statusKeepCommits = 10
 // from the deployed branch so a repo can carry several deploy lines, each with
 // its own per-node status, e.g. "kompensator-status/customer03". A "-status"
 // suffix (rather than nesting under the branch name) is required: git stores
-// refs as files, so "kompensator/status/customer03" would collide with the
+// refs as files, so "github.com/kratecorg/kompensator/status/customer03" would collide with the
 // existing "kompensator" ref (directory/file conflict).
 func statusBranch(deployBranch, node string) string {
 	if deployBranch == "" {

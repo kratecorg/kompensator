@@ -19,12 +19,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"kompensator/internal/config"
-	"kompensator/internal/cron"
-	"kompensator/internal/gitsync"
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
-	"kompensator/internal/secrets"
+	"github.com/kratecorg/kompensator/internal/config"
+	"github.com/kratecorg/kompensator/internal/cron"
+	"github.com/kratecorg/kompensator/internal/gitsync"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/secrets"
 )
 
 // defaultNodeHome is where a node's kompensator home is placed when an ssh

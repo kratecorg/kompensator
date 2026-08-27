@@ -13,12 +13,12 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"kompensator/internal/admin"
-	"kompensator/internal/check"
-	"kompensator/internal/config"
-	"kompensator/internal/reconcile"
-	"kompensator/internal/verify"
-	"kompensator/internal/version"
+	"github.com/kratecorg/kompensator/internal/admin"
+	"github.com/kratecorg/kompensator/internal/check"
+	"github.com/kratecorg/kompensator/internal/config"
+	"github.com/kratecorg/kompensator/internal/reconcile"
+	"github.com/kratecorg/kompensator/internal/verify"
+	"github.com/kratecorg/kompensator/internal/version"
 )
 
 // buildVersion is the release tag, injected at build time with

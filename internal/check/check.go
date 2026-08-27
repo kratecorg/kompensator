@@ -14,12 +14,12 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"kompensator/internal/config"
-	"kompensator/internal/cron"
-	"kompensator/internal/gitsync"
-	"kompensator/internal/repo"
-	"kompensator/internal/secrets"
-	"kompensator/internal/version"
+	"github.com/kratecorg/kompensator/internal/config"
+	"github.com/kratecorg/kompensator/internal/cron"
+	"github.com/kratecorg/kompensator/internal/gitsync"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/secrets"
+	"github.com/kratecorg/kompensator/internal/version"
 )
 
 // Result is one bootstrap check outcome.

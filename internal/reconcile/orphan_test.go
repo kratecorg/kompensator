@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
 )
 
 // writeRepoFile creates repoRoot/<rel> with the given content, making parents.

@@ -18,7 +18,7 @@ func TestPublishStatusBranchRolling(t *testing.T) {
 		t.Fatalf("init bare: %v: %s", err, out)
 	}
 	gitDir := filepath.Join(tmp, "statusgit")
-	branch := "kompensator/status/c03"
+	branch := "github.com/kratecorg/kompensator/status/c03"
 
 	for i := 1; i <= 13; i++ {
 		files := map[string][]byte{

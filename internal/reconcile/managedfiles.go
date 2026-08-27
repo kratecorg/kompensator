@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
 )
 
 // materializeManagedFiles writes every managed file the node needs to its host

@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
-	"kompensator/internal/secrets"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/secrets"
 )
 
 // containerTokenPrefix / containerTokenSuffix delimit the placeholder a reload

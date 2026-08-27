@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"kompensator/internal/config"
-	"kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/config"
+	"github.com/kratecorg/kompensator/internal/repo"
 
 	"gopkg.in/yaml.v3"
 )

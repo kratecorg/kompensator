@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kompensator/internal/repo"
-	"kompensator/internal/runtime"
+	"github.com/kratecorg/kompensator/internal/repo"
+	"github.com/kratecorg/kompensator/internal/runtime"
 )
 
 // managedFileEnv declares one file fed by a stack-scoped variable, which is the

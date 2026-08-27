@@ -1,4 +1,4 @@
-module kompensator
+module github.com/kratecorg/kompensator
 
 go 1.24.2
 
