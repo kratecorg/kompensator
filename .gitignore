@@ -1,0 +1,14 @@
+# build artifacts
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+coverage.*
+
+# locale env / secrets
+*.env.local
+*.age
+.DS_Store
+planning/
