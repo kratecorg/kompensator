@@ -1,0 +1,9 @@
+# The "web" stack: a single project deployed with the recreate strategy.
+name: web
+
+projects:
+  # recreate: kompensator stops the old container and starts the new one. Simple,
+  # with a brief interruption. Use blue-green (see example 02) for zero downtime.
+  - name: app
+    compose: compose/app.yml
+    strategy: recreate

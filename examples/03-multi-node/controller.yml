@@ -1,0 +1,7 @@
+# kompensator controller config — an operator workstation that tracks one or
+# more deployment repos and drives the nodes over SSH. Place this as
+# controller.yml in the operator's kompensator home.
+repos:
+  - name: example
+    url: https://github.com/kratecorg/deployment-example.git
+    branch: main

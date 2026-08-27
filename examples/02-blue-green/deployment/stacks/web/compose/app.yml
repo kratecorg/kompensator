@@ -1,0 +1,26 @@
+# app project (blue-green). kompensator injects FRONTEND_IMAGE / FRONTEND_TAG
+# from the env state file, plus NODE_NAME, ENV_NAME and COLOR at deploy time.
+#
+# The frontend publishes no host port: it is reached only through the stack's
+# managed Traefik over the shared "internal" network. Each color registers the
+# alias "frontend-${COLOR}" so both colors can run side by side during a switch.
+services:
+  frontend:
+    image: ${FRONTEND_IMAGE}:${FRONTEND_TAG}
+    restart: always
+    networks:
+      internal:
+        aliases:
+          - frontend-${COLOR}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# The stack's shared networks, created by kompensator and referenced as external.
+networks:
+  internal:
+    external: true
+    name: ${STACK_PREFIX}-internal

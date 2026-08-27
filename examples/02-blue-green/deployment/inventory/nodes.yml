@@ -1,0 +1,5 @@
+# Nodes known to this deployment repo.
+# location: an absolute path (local node) or ssh://[user@]host[:port]/path.
+nodes:
+  - name: local
+    location: /root/.config/kompensator

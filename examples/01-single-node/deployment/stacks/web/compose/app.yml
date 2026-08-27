@@ -1,0 +1,13 @@
+# app project (recreate). kompensator injects WHOAMI_IMAGE / WHOAMI_TAG from the
+# env state file (state/web.yml), plus NODE_NAME and ENV_NAME.
+#
+# No healthcheck: traefik/whoami is a minimal (scratch) image with no shell or
+# wget, so a container healthcheck cannot run inside it. With the recreate
+# strategy kompensator waits for the container to be running. See example 02 for
+# a healthcheck-driven Blue/Green flow.
+services:
+  whoami:
+    image: ${WHOAMI_IMAGE}:${WHOAMI_TAG}
+    restart: always
+    ports:
+      - "${WEB_PORT:-8080}:80"

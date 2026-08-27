@@ -1,0 +1,10 @@
+# Desired image tags for the "web" stack in the prod environment.
+# Layout: <project>.<service> = { image, tag }.
+frontend:
+  frontend:
+    image: nginxdemos/hello
+    tag: "0.3-plain-text"
+cache:
+  cache:
+    image: redis
+    tag: 7-alpine

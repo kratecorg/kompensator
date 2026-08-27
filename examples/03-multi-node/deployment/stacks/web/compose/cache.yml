@@ -1,0 +1,13 @@
+# cache project (pinned to node-db — see prod/env.yml placement).
+# kompensator injects CACHE_IMAGE / CACHE_TAG, plus NODE_NAME and ENV_NAME.
+services:
+  cache:
+    image: ${CACHE_IMAGE}:${CACHE_TAG}
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s

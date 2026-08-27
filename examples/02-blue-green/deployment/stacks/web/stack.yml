@@ -1,0 +1,32 @@
+# The "web" stack: a Blue/Green frontend behind a kompensator-managed Traefik.
+name: web
+
+# Shared docker networks for this stack. kompensator creates them (idempotently)
+# BEFORE any project or the managed proxy deploys. The node name is part of
+# ${STACK_PREFIX}, so each node gets its own set. Compose files reference these
+# as external.
+networks:
+  - ${STACK_PREFIX}-internal
+  - ${STACK_PREFIX}-external
+
+# Managed proxy: kompensator synthesizes and runs a stack-internal Traefik and
+# rewrites its routes on every Blue/Green switch. It joins the networks below;
+# an external edge proxy reaches it under the alias "web-traefik".
+proxy:
+  kind: traefik
+  networks:
+    - name: ${STACK_PREFIX}-external
+      aliases:
+        - web-traefik
+    - name: ${STACK_PREFIX}-internal
+      aliases:
+        - web-traefik
+
+projects:
+  - name: app
+    compose: compose/app.yml
+    strategy: blue-green
+    # Route the managed Traefik forwards to this project's service. kompensator
+    # points the router at the healthy color after each switch.
+    proxy:
+      - { router: web, service: frontend, port: 80, rule: "PathPrefix(`/`)" }

@@ -1,0 +1,7 @@
+# Nodes known to this deployment repo.
+# Nodes are just nodes; which node runs which environment is decided by the
+# environment definitions (environments/<env>/env.yml), not here.
+# location: an absolute path (local node) or ssh://[user@]host[:port]/path.
+nodes:
+  - name: local
+    location: /root/.config/kompensator

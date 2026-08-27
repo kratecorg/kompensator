@@ -1,0 +1,10 @@
+# kompensator node-local config — a node that follows one deployment repo and
+# reconciles itself. Place this as node.yml in the node's kompensator home
+# (default: ~/.config/kompensator/node.yml).
+node: local
+repo:
+  name: example
+  # Point this at a Git repo holding the contents of this example's deployment/
+  # directory (a local file:// clone works for a quick try-out).
+  url: https://github.com/kratecorg/deployment-example.git
+  branch: main

@@ -1,0 +1,11 @@
+# Nodes known to this deployment repo.
+# Nodes are just nodes; which node runs which project is decided by placement in
+# environments/<env>/env.yml, not here.
+# location: an absolute path (local node) or ssh://[user@]host[:port]/path.
+nodes:
+  - name: node-a
+    location: ssh://deploy@10.0.0.11/home/deploy/.config/kompensator
+  - name: node-b
+    location: ssh://deploy@10.0.0.12/home/deploy/.config/kompensator
+  - name: node-db
+    location: ssh://deploy@10.0.0.13/home/deploy/.config/kompensator

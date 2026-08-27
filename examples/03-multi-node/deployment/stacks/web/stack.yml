@@ -1,0 +1,15 @@
+# The "web" stack: two independently-placed projects (see prod/env.yml).
+name: web
+
+projects:
+  - name: frontend
+    compose: compose/frontend.yml
+    strategy: recreate
+  - name: cache
+    compose: compose/cache.yml
+    strategy: recreate
+
+# Stack defaults for the variables the compose files reference. Overridden per
+# environment (see prod/env.yml).
+variables:
+  WEB_PORT: "8080"

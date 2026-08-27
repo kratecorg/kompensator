@@ -1,0 +1,7 @@
+# Desired image tags for the "web" stack in the dev environment.
+# Layout: <project>.<service> = { image, tag }.
+# kompensator injects these as FRONTEND_IMAGE / FRONTEND_TAG.
+app:
+  frontend:
+    image: nginxdemos/hello
+    tag: "0.3-plain-text"

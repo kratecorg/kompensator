@@ -1,0 +1,7 @@
+# Desired image tags for the "web" stack in the dev environment.
+# Layout: <project>.<service> = { image, tag }.
+# kompensator injects these into the compose file as WHOAMI_IMAGE / WHOAMI_TAG.
+app:
+  whoami:
+    image: traefik/whoami
+    tag: v1.10.4
