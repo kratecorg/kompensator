@@ -460,18 +460,39 @@ func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers
 		}
 	}
 
-	if !keepHome {
-		if loc.Local && loc.Path != "" {
+	if !keepHome && removed.Location != "" {
+		if err := removableHome(loc.Path); err != nil {
+			log.Warn("leaving node home in place", "path", loc.Path, "error", err)
+		} else if loc.Local {
 			log.Info("removing node home", "path", loc.Path)
 			if err := os.RemoveAll(loc.Path); err != nil {
 				return fmt.Errorf("remove node home %s: %w", loc.Path, err)
 			}
-		} else if !loc.Local {
-			log.Warn("node is remote, leaving its home in place", "host", loc.Host, "path", loc.Path)
+		} else {
+			log.Info("removing node home", "host", loc.Host, "path", loc.Path)
+			if err := remoteRun(ctx, loc, "rm -rf "+shellQuote(loc.Path)); err != nil {
+				return fmt.Errorf("remove node home %s:%s: %w", loc.Host, loc.Path, err)
+			}
 		}
 	}
 
 	log.Info("node removed", "node", name)
+	return nil
+}
+
+// removableHome rejects home paths that are too shallow to delete recursively
+// ("/", "/home", …), so a malformed inventory location can never wipe a node.
+func removableHome(path string) error {
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		return fmt.Errorf("empty home path")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("home path %s is not absolute", path)
+	}
+	if strings.Count(path, "/") < 2 {
+		return fmt.Errorf("home path %s is too shallow to remove", path)
+	}
 	return nil
 }
 
