@@ -779,6 +779,31 @@ func StackDir(repoRoot, stack string) string {
 	return filepath.Join(repoRoot, "stacks", stack)
 }
 
+// ListStacks returns the names of every stack defined in the repo (every
+// stacks/<name>/ directory that holds a stack.yml), sorted.
+func ListStacks(repoRoot string) ([]string, error) {
+	dir := filepath.Join(repoRoot, "stacks")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read stacks dir: %w", err)
+	}
+	var stacks []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, e.Name(), "stack.yml")); err != nil {
+			continue
+		}
+		stacks = append(stacks, e.Name())
+	}
+	sort.Strings(stacks)
+	return stacks, nil
+}
+
 // LoadStack reads stacks/<stack>/stack.yml.
 func LoadStack(repoRoot, stack string) (Stack, error) {
 	var s Stack

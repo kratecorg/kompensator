@@ -72,6 +72,10 @@ func main() {
 		os.Exit(2)
 	case "secrets":
 		os.Exit(cmdSecrets(g, rest))
+	case "completion":
+		os.Exit(cmdCompletion(rest))
+	case "__complete":
+		os.Exit(cmdComplete(rest))
 	case "version":
 		fmt.Println("kompensator", version.Current(buildVersion).Token())
 	case "help":
@@ -1012,6 +1016,9 @@ Commands:
   secrets edit <env> <stack>   Edit an environment's stack secrets in $EDITOR
   secrets rekey <env>          Re-encrypt an environment's secrets (KV and file)
                                for the current recipient set
+  completion <shell>
+                    Print a shell completion script (bash, zsh or fish) that
+                    completes commands, flags and names read from the repo
   version           Print version
   help              Show this help
 
@@ -1028,5 +1035,6 @@ Examples:
   kompensator -home /opt/controller node remove node7
   echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
   kompensator -home /opt/controller secrets rekey prod
+  source <(kompensator completion bash)
 `)
 }

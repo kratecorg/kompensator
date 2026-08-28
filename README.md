@@ -77,9 +77,25 @@ Common commands:
 | `controller init` / `controller repo add` | Set up a controller home and its deployment repos |
 | `node add` / `node remove` | Provision or deregister a node from the controller |
 | `secrets …` | Manage age-encrypted environment and file secrets |
+| `completion <shell>` | Print a shell completion script (bash, zsh, fish) |
 | `version` | Print the version |
 
 Run `kompensator help` for the full command reference.
+
+### Shell completion
+
+Completion is served by the binary itself, so it offers the environment, stack,
+project and node names read from the local deployment-repo checkout — not just
+the static command tree.
+
+```bash
+# bash
+kompensator completion bash | sudo tee /etc/bash_completion.d/kompensator
+# zsh
+kompensator completion zsh > "${fpath[1]}/_kompensator"
+# fish
+kompensator completion fish > ~/.config/fish/completions/kompensator.fish
+```
 
 ## Documentation
 
