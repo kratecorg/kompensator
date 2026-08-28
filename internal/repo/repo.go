@@ -880,11 +880,17 @@ func SecretsFile(repoRoot, env, stack string) string {
 	return filepath.Join(repoRoot, "environments", env, "secrets", stack+".yml.age")
 }
 
+// StateFile returns the absolute path to a stack's desired-state file for an
+// environment: environments/<env>/state/<stack>.yml.
+func StateFile(repoRoot, env, stack string) string {
+	return filepath.Join(EnvironmentDir(repoRoot, env), "state", stack+".yml")
+}
+
 // LoadStackState reads environments/<env>/state/<stack>.yml as the desired
 // state for the stack. A missing file yields an empty state (no desired images
 // yet), not an error.
 func LoadStackState(repoRoot, env, stack string) (StackState, error) {
-	path := filepath.Join(repoRoot, "environments", env, "state", stack+".yml")
+	path := StateFile(repoRoot, env, stack)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

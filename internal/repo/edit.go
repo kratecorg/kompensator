@@ -14,18 +14,10 @@ import (
 // so the comments in a hand-written env.yml or stack.yml survive. The key is
 // created, or an empty/null value converted, when the sequence is not there yet.
 func AppendToSequence(path, key string, item any) error {
-	data, err := os.ReadFile(path)
+	doc, err := loadDocument(path)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return err
 	}
-	var doc yaml.Node
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
-	}
-	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
-		return fmt.Errorf("%s: expected a mapping at the top level", path)
-	}
-	keepBlankLines(&doc, strings.Split(string(data), "\n"))
 	seq, err := sequenceAt(doc.Content[0], key)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
@@ -35,44 +27,163 @@ func AppendToSequence(path, key string, item any) error {
 		return fmt.Errorf("encode %s entry: %w", key, err)
 	}
 	seq.Content = append(seq.Content, &add)
+	return writeDocument(path, doc)
+}
 
+// RemoveFromSequence drops the entry called name from the sequence under key,
+// matching either a bare scalar ("- carimco") or a mapping with that name. It
+// reports whether an entry was there to remove.
+func RemoveFromSequence(path, key, name string) (bool, error) {
+	doc, err := loadDocument(path)
+	if err != nil {
+		return false, err
+	}
+	seq := valueAt(doc.Content[0], key)
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return false, nil
+	}
+	for i, item := range seq.Content {
+		if entryName(item) != name {
+			continue
+		}
+		seq.Content = append(seq.Content[:i], seq.Content[i+1:]...)
+		return true, writeDocument(path, doc)
+	}
+	return false, nil
+}
+
+// SetStateImage points a service's desired image and tag in a state file,
+// creating the project or service entry when it is not there yet. Keys the
+// caller did not name (oneShot) and the file's comments are left alone.
+func SetStateImage(path, project, service, image, tag string) error {
+	doc, err := loadDocument(path)
+	if err != nil {
+		return err
+	}
+	proj, err := mappingAt(doc.Content[0], project)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	svc, err := mappingAt(proj, service)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	setScalar(svc, "image", image)
+	setScalar(svc, "tag", tag)
+	return writeDocument(path, doc)
+}
+
+// loadDocument parses a YAML file into a document tree whose comments and blank
+// lines survive a re-encode.
+func loadDocument(path string) (*yaml.Node, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("%s: expected a mapping at the top level", path)
+	}
+	keepBlankLines(&doc, strings.Split(string(data), "\n"))
+	return &doc, nil
+}
+
+func writeDocument(path string, doc *yaml.Node) error {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
-	if err := enc.Encode(&doc); err != nil {
+	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
 	enc.Close()
 	return os.WriteFile(path, buf.Bytes(), 0o644)
 }
 
+// entryName is the name a sequence entry goes by: its own value when it is a
+// bare scalar, its "name" field when it is a mapping.
+func entryName(item *yaml.Node) string {
+	if item.Kind == yaml.ScalarNode {
+		return item.Value
+	}
+	if n := valueAt(item, "name"); n != nil {
+		return n.Value
+	}
+	return ""
+}
+
+// valueAt returns the value node of key, or nil when the mapping has no such
+// key.
+func valueAt(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// mappingAt returns the value node of key as a block mapping, creating it (or
+// converting a null placeholder) when needed.
+func mappingAt(mapping *yaml.Node, key string) (*yaml.Node, error) {
+	v := valueAt(mapping, key)
+	if v == nil {
+		k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+		v = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		mapping.Content = append(mapping.Content, k, v)
+		return v, nil
+	}
+	switch {
+	case v.Kind == yaml.MappingNode:
+		v.Style = 0
+		return v, nil
+	case v.Kind == yaml.ScalarNode && v.Tag == "!!null":
+		*v = yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		return v, nil
+	default:
+		return nil, fmt.Errorf("%q is not a mapping", key)
+	}
+}
+
+// setScalar sets key to a string value, appending the key when it is absent.
+func setScalar(mapping *yaml.Node, key, value string) {
+	if v := valueAt(mapping, key); v != nil {
+		v.Kind, v.Tag, v.Value, v.Style = yaml.ScalarNode, "!!str", value, 0
+		v.Content = nil
+		return
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+	)
+}
+
 // sequenceAt returns the value node of key as a block sequence. An absent key is
 // appended; a null or flow-style value is converted in place, which keeps the
 // comment on a documented but still empty "projects:".
 func sequenceAt(mapping *yaml.Node, key string) (*yaml.Node, error) {
-	for i := 0; i+1 < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value != key {
-			continue
-		}
-		v := mapping.Content[i+1]
-		switch v.Kind {
-		case yaml.SequenceNode:
-			v.Style = 0
-			return v, nil
-		case yaml.ScalarNode:
-			if v.Tag != "!!null" {
-				return nil, fmt.Errorf("%q is not a list", key)
-			}
-			*v = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-			return v, nil
-		default:
-			return nil, fmt.Errorf("%q is not a list", key)
-		}
+	v := valueAt(mapping, key)
+	if v == nil {
+		k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+		v = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		mapping.Content = append(mapping.Content, k, v)
+		return v, nil
 	}
-	k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
-	v := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-	mapping.Content = append(mapping.Content, k, v)
-	return v, nil
+	switch {
+	case v.Kind == yaml.SequenceNode:
+		v.Style = 0
+		return v, nil
+	case v.Kind == yaml.ScalarNode && v.Tag == "!!null":
+		*v = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		return v, nil
+	default:
+		return nil, fmt.Errorf("%q is not a list", key)
+	}
 }
 
 // keepBlankLines restores the blank lines yaml.v3 drops on re-encode. Every

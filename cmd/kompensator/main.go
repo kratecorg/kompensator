@@ -73,6 +73,8 @@ func main() {
 		os.Exit(cmdStack(g, rest))
 	case "project":
 		os.Exit(cmdProject(g, rest))
+	case "state":
+		os.Exit(cmdState(g, rest))
 	case "bootstrap":
 		fmt.Fprintln(os.Stderr, "error: 'bootstrap' is now 'kompensator node add <name> <location>'")
 		os.Exit(2)
@@ -670,19 +672,31 @@ func dash(s string) string {
 	return s
 }
 
+// stringList collects a flag that may be repeated.
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+
 // cmdEnv handles environment administration in the deployment repo.
 func cmdEnv(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list|add|remove|stack> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "list":
 		return cmdEnvList(g, rest)
+	case "add":
+		return cmdEnvAdd(g, rest)
+	case "remove":
+		return cmdEnvRemove(g, rest)
+	case "stack":
+		return cmdEnvStack(g, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown env subcommand: %s\n", sub)
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list|add|remove|stack> ...")
 		return 2
 	}
 }
@@ -723,10 +737,185 @@ func cmdEnvList(g globals, args []string) int {
 	return 0
 }
 
+func cmdEnvAdd(g globals, args []string) int {
+	fs := flag.NewFlagSet("env add", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	var vars stringList
+	fs.Var(&vars, "var", "seed env.yml with a KEY=VALUE override (repeatable)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env add <name> [--var KEY=VALUE] [--repo <name>] [--dry-run]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	name := arg(pos, 0)
+	if name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.EnvAdd(ctx, admin.EnvAddOptions{
+		Home:      h,
+		RepoName:  *repoName,
+		Name:      name,
+		Variables: vars,
+		DryRun:    *dryRun,
+		Logger:    log,
+	}); err != nil {
+		log.Error("env add failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdEnvRemove(g globals, args []string) int {
+	fs := flag.NewFlagSet("env remove", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env remove <name> [--repo <name>] [--dry-run]")
+		fmt.Fprintln(os.Stderr, "  Deletes the environment with its state and secrets. Unplace its stacks first.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	name := arg(pos, 0)
+	if name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.EnvRemove(ctx, h, *repoName, name, *dryRun, log); err != nil {
+		log.Error("env remove failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdEnvStack places a stack in an environment, or takes it out again.
+func cmdEnvStack(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env stack <add|remove> <env> <stack> ...")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "add":
+		return cmdEnvStackAdd(g, rest)
+	case "remove":
+		return cmdEnvStackRemove(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown env stack subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env stack <add|remove> <env> <stack> ...")
+		return 2
+	}
+}
+
+func cmdEnvStackAdd(g globals, args []string) int {
+	fs := flag.NewFlagSet("env stack add", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	var nodes stringList
+	fs.Var(&nodes, "node", "pin the stack to this node (repeatable; default: every node)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env stack add <env> <stack> [--node <name>] [--repo <name>] [--dry-run]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack := arg(pos, 0), arg(pos, 1)
+	if env == "" || stack == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.EnvStackAdd(ctx, admin.EnvStackAddOptions{
+		Home:     h,
+		RepoName: *repoName,
+		Env:      env,
+		Stack:    stack,
+		Nodes:    nodes,
+		DryRun:   *dryRun,
+		Logger:   log,
+	}); err != nil {
+		log.Error("env stack add failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdEnvStackRemove(g globals, args []string) int {
+	fs := flag.NewFlagSet("env stack remove", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env stack remove <env> <stack> [--repo <name>] [--dry-run]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack := arg(pos, 0), arg(pos, 1)
+	if env == "" || stack == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.EnvStackRemove(ctx, h, *repoName, env, stack, *dryRun, log); err != nil {
+		log.Error("env stack remove failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
 // cmdStack handles stack administration in the deployment repo.
 func cmdStack(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add|remove> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
@@ -735,9 +924,11 @@ func cmdStack(g globals, args []string) int {
 		return cmdStackList(g, rest)
 	case "add":
 		return cmdStackAdd(g, rest)
+	case "remove":
+		return cmdStackRemove(g, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown stack subcommand: %s\n", sub)
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add|remove> ...")
 		return 2
 	}
 }
@@ -821,19 +1012,56 @@ func cmdStackAdd(g globals, args []string) int {
 	return 0
 }
 
+func cmdStackRemove(g globals, args []string) int {
+	fs := flag.NewFlagSet("stack remove", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack remove <name> [--repo <name>] [--dry-run]")
+		fmt.Fprintln(os.Stderr, "  Deletes stacks/<name>/. Unplace the stack from every environment first.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	name := arg(pos, 0)
+	if name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.StackRemove(ctx, h, *repoName, name, *dryRun, log); err != nil {
+		log.Error("stack remove failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
 // cmdProject handles project administration inside a stack.
 func cmdProject(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add|remove> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "add":
 		return cmdProjectAdd(g, rest)
+	case "remove":
+		return cmdProjectRemove(g, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown project subcommand: %s\n", sub)
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add|remove> ...")
 		return 2
 	}
 }
@@ -885,6 +1113,119 @@ func cmdProjectAdd(g globals, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func cmdProjectRemove(g globals, args []string) int {
+	fs := flag.NewFlagSet("project remove", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project remove <stack> <project> [--repo <name>] [--dry-run]")
+		fmt.Fprintln(os.Stderr, "  Drops the project from stack.yml and deletes its compose file.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	stack, name := arg(pos, 0), arg(pos, 1)
+	if stack == "" || name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.ProjectRemove(ctx, h, *repoName, stack, name, *dryRun, log); err != nil {
+		log.Error("project remove failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdState handles the desired-image state a CI pipeline writes.
+func cmdState(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] state set <env> <stack> <project> <service> <image>:<tag>")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "set":
+		return cmdStateSet(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown state subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] state <set> ...")
+		return 2
+	}
+}
+
+func cmdStateSet(g globals, args []string) int {
+	fs := flag.NewFlagSet("state set", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] state set <env> <stack> <project> <service> <image>:<tag> [--repo <name>] [--dry-run]")
+		fmt.Fprintln(os.Stderr, "  Points one service at an image and pushes; the nodes deploy it on their next reconcile.")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	env, stack, project, service, ref := arg(pos, 0), arg(pos, 1), arg(pos, 2), arg(pos, 3), arg(pos, 4)
+	if env == "" || stack == "" || project == "" || service == "" || ref == "" {
+		fs.Usage()
+		return 2
+	}
+	image, tag, ok := splitImageRef(ref)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "error: %q is not an <image>:<tag> reference\n", ref)
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.StateSet(ctx, admin.StateSetOptions{
+		Home:     h,
+		RepoName: *repoName,
+		Env:      env,
+		Stack:    stack,
+		Project:  project,
+		Service:  service,
+		Image:    image,
+		Tag:      tag,
+		DryRun:   *dryRun,
+		Logger:   log,
+	}); err != nil {
+		log.Error("state set failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// splitImageRef splits an image reference at the tag separator, leaving a
+// registry port ("registry.example.org:5000/app:v1") alone.
+func splitImageRef(ref string) (image, tag string, ok bool) {
+	i := strings.LastIndex(ref, ":")
+	if i <= 0 || strings.Contains(ref[i+1:], "/") || i+1 == len(ref) {
+		return "", "", false
+	}
+	return ref[:i], ref[i+1:], true
 }
 
 func cmdSecrets(g globals, args []string) int {
@@ -1229,10 +1570,22 @@ Commands:
                     --repo <name>   which repo's inventory (default: the sole one)
   env list          List the environments the deployment repo defines and the
                     stacks each one places
+  env add <name>    Scaffold environments/<name>/env.yml
+                    --var KEY=VALUE seed an environment variable override
+                    --dry-run       show the diff instead of pushing it
+  env remove <name> Delete an environment with its state and secrets; its
+                    stacks have to be unplaced first
+  env stack add <env> <stack>
+                    Place a stack in an environment
+                    --node <name>   pin it to a node (repeatable)
+  env stack remove <env> <stack>
+                    Take a stack out of an environment, keeping its state
   stack list        List the stacks, their projects and where they are placed
   stack add <name>  Scaffold stacks/<name>/stack.yml in the deployment repo
                     --proxy traefik give the stack a managed reverse proxy
                     --dry-run       show the diff instead of pushing it
+  stack remove <name>
+                    Delete stacks/<name>/; unplace it from every env first
   project add <stack> <project>
                     Scaffold a compose file for the project and register it in
                     the stack, keeping stack.yml's comments intact
@@ -1241,6 +1594,12 @@ Commands:
                     --port <n>        the service's container port
                     --route           route it through the stack's proxy
                     --dry-run         show the diff instead of pushing it
+  project remove <stack> <project>
+                    Drop the project from its stack and delete its compose file
+  state set <env> <stack> <project> <service> <image>:<tag>
+                    Point one service at an image and push it; this is what a
+                    CI pipeline calls to deploy
+                    --dry-run       show the diff instead of pushing it
   secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
                                secrets for an environment's stack
   secrets set-key <env> <stack> <KEY> [value]
@@ -1272,6 +1631,9 @@ Examples:
   kompensator -home /opt/controller node remove node7
   kompensator -home /opt/controller stack add shop --proxy traefik
   kompensator -home /opt/controller project add shop api --port 8080 --route
+  kompensator -home /opt/controller env add prod --var LOG_LEVEL=info
+  kompensator -home /opt/controller env stack add prod shop --node node7
+  kompensator -home /opt/controller state set prod shop api api registry.example.org/api:v1.4.2
   echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
   kompensator -home /opt/controller secrets rekey prod
   source <(kompensator completion bash)

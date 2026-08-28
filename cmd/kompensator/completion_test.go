@@ -39,6 +39,21 @@ func TestCompleteWords(t *testing.T) {
 			want: []string{"add"},
 		},
 		{
+			name: "env subcommands",
+			args: []string{"env", ""},
+			want: []string{"list", "add", "remove", "stack"},
+		},
+		{
+			name: "env stack subcommands",
+			args: []string{"env", "stack", ""},
+			want: []string{"add", "remove"},
+		},
+		{
+			name: "state subcommands",
+			args: []string{"state", ""},
+			want: []string{"set"},
+		},
+		{
 			name: "flags with two dashes",
 			args: []string{"reconcile", "--"},
 			want: []string{"--force", "--prune", "--ignore-pause", "--repo", "--home", "--json"},

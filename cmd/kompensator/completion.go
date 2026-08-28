@@ -121,7 +121,34 @@ func completionSpec() compCmd {
 			},
 			{
 				name: "env",
-				subs: []compCmd{{name: "list", flags: []compFlag{repoFlag()}}},
+				subs: []compCmd{
+					{name: "list", flags: []compFlag{repoFlag()}},
+					{
+						name:  "add",
+						flags: []compFlag{valueFlag("var"), repoFlag(), boolFlag("dry-run")},
+						args:  []compArg{free},
+					},
+					{
+						name:  "remove",
+						flags: []compFlag{repoFlag(), boolFlag("dry-run")},
+						args:  []compArg{envArg},
+					},
+					{name: "stack", subs: []compCmd{
+						{
+							name: "add",
+							flags: []compFlag{
+								{name: "node", value: true, values: compNodes},
+								repoFlag(), boolFlag("dry-run"),
+							},
+							args: []compArg{envArg, {values: compStacks(-1)}},
+						},
+						{
+							name:  "remove",
+							flags: []compFlag{repoFlag(), boolFlag("dry-run")},
+							args:  []compArg{envArg, {values: compStacks(0)}},
+						},
+					}},
+				},
 			},
 			{
 				name: "stack",
@@ -134,6 +161,11 @@ func completionSpec() compCmd {
 							repoFlag(), boolFlag("dry-run"),
 						},
 						args: []compArg{free},
+					},
+					{
+						name:  "remove",
+						flags: []compFlag{repoFlag(), boolFlag("dry-run")},
+						args:  []compArg{{values: compStacks(-1)}},
 					},
 				},
 			},
@@ -148,6 +180,23 @@ func completionSpec() compCmd {
 							valueFlag("port"), boolFlag("route"), repoFlag(), boolFlag("dry-run"),
 						},
 						args: []compArg{{values: compStacks(-1)}, free},
+					},
+					{
+						name:  "remove",
+						flags: []compFlag{repoFlag(), boolFlag("dry-run")},
+						args:  []compArg{{values: compStacks(-1)}, {values: compProjects(0)}},
+					},
+				},
+			},
+			{
+				name: "state",
+				subs: []compCmd{
+					{
+						name:  "set",
+						flags: []compFlag{repoFlag(), boolFlag("dry-run")},
+						args: []compArg{
+							envArg, {values: compStacks(0)}, {values: compProjects(1)}, free, free,
+						},
 					},
 				},
 			},

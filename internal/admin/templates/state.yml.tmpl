@@ -1,0 +1,10 @@
+# Desired images for the {{.Stack}} stack in the {{.Env}} environment.
+# Layout: <project>.<service> = { image, tag }.
+#
+# This file is what a CI pipeline writes to deploy: 'kompensator state set'
+# updates a single service here and pushes, the nodes pick the change up on their
+# next reconcile. A service with no entry is not deployed at all.
+{{.Project}}:
+  {{.Service}}:
+    image: {{.Image}}
+    tag: {{.Tag}}

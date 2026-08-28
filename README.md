@@ -76,6 +76,10 @@ Common commands:
 | `check` | Audit a node/controller setup |
 | `controller init` / `controller repo add` | Set up a controller home and its deployment repos |
 | `node add` / `node remove` | Provision or deregister a node from the controller |
+| `env list` / `stack list` | Show what the deployment repo defines and where it is placed |
+| `env add` / `env stack add` | Create an environment and place stacks in it |
+| `stack add` / `project add` | Scaffold a stack and its compose projects |
+| `state set <env> <stack> <project> <service> <image>:<tag>` | Point a service at an image (the CI deploy call) |
 | `secrets …` | Manage age-encrypted environment and file secrets |
 | `completion <shell>` | Print a shell completion script (bash, zsh, fish) |
 | `version` | Print the version |
