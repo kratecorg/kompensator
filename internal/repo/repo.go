@@ -2,6 +2,7 @@ package repo
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -692,13 +693,23 @@ func (s ServiceImage) Ref() string {
 // desired image/tag.
 type StackState map[string]map[string]ServiceImage
 
-// LoadInventory reads inventory/nodes.yml from the checked-out repo root.
+// LoadInventory reads inventory/nodes.yml from the checked-out repo root. A
+// repo that has no inventory yet has no nodes; the file is written by the first
+// 'node add'.
 func LoadInventory(repoRoot string) (Inventory, error) {
 	var inv Inventory
-	if err := loadYAML(filepath.Join(repoRoot, "inventory", "nodes.yml"), &inv); err != nil {
+	if err := loadYAML(InventoryPath(repoRoot), &inv); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Inventory{}, nil
+		}
 		return Inventory{}, err
 	}
 	return inv, nil
+}
+
+// InventoryPath is the inventory file's location inside a deployment repo.
+func InventoryPath(repoRoot string) string {
+	return filepath.Join(repoRoot, "inventory", "nodes.yml")
 }
 
 // SaveInventory writes inventory/nodes.yml back to the repo, overwriting it
@@ -714,7 +725,7 @@ func SaveInventory(repoRoot string, inv Inventory) error {
 	}
 	enc.Close()
 
-	path := filepath.Join(repoRoot, "inventory", "nodes.yml")
+	path := InventoryPath(repoRoot)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create inventory dir: %w", err)
 	}

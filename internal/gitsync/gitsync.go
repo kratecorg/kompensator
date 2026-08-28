@@ -32,6 +32,77 @@ func Sync(ctx context.Context, url, branch, dest string) (commit string, err err
 	return head(ctx, dest)
 }
 
+// SyncInit is Sync for the controller, which may be pointed at a brand-new
+// deployment repo: when branch does not exist on the remote yet — including a
+// repo with no commits at all — it is created locally instead of failing, so the
+// first CommitPush publishes it. Nodes keep using Sync, which stays strict.
+//
+// The returned commit is empty while the branch is still unborn.
+func SyncInit(ctx context.Context, url, branch, dest string) (commit string, err error) {
+	if branch == "" {
+		branch = "main"
+	}
+
+	onRemote, err := remoteBranchExists(ctx, url, branch)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case !isGitRepo(dest) && onRemote:
+		err = clone(ctx, url, branch, dest)
+	case !isGitRepo(dest):
+		err = cloneNewBranch(ctx, url, branch, dest)
+	case onRemote:
+		err = pull(ctx, branch, dest)
+	}
+	if err != nil {
+		return "", err
+	}
+	if !hasCommits(ctx, dest) {
+		return "", nil
+	}
+	return head(ctx, dest)
+}
+
+// remoteBranchExists reports whether url advertises refs/heads/branch. An empty
+// repo advertises nothing, which is the same answer for our purposes.
+func remoteBranchExists(ctx context.Context, url, branch string) (bool, error) {
+	out, err := run(ctx, "", "git", "ls-remote", "--heads", url, "refs/heads/"+branch)
+	if err != nil {
+		return false, fmt.Errorf("git ls-remote %s: %w: %s", url, err, out)
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// cloneNewBranch clones a repo that does not carry branch yet and puts the
+// checkout on it: branched off the default branch's tip when the repo has
+// commits, unborn when it is empty.
+func cloneNewBranch(ctx context.Context, url, branch, dest string) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("create repos dir: %w", err)
+	}
+	if out, err := run(ctx, "", "git", "clone", url, dest); err != nil {
+		return fmt.Errorf("git clone %s: %w: %s", url, err, out)
+	}
+	if hasCommits(ctx, dest) {
+		if out, err := run(ctx, dest, "git", "checkout", "-B", branch); err != nil {
+			return fmt.Errorf("git checkout -B %s: %w: %s", branch, err, out)
+		}
+		return nil
+	}
+	if out, err := run(ctx, dest, "git", "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+		return fmt.Errorf("git symbolic-ref HEAD %s: %w: %s", branch, err, out)
+	}
+	return nil
+}
+
+// hasCommits reports whether the checkout's HEAD resolves, i.e. the branch is
+// not unborn.
+func hasCommits(ctx context.Context, dest string) bool {
+	_, err := run(ctx, dest, "git", "rev-parse", "--verify", "--quiet", "HEAD")
+	return err == nil
+}
+
 func isGitRepo(dest string) bool {
 	info, err := os.Stat(filepath.Join(dest, ".git"))
 	return err == nil && info.IsDir()
@@ -56,6 +127,11 @@ func pull(ctx context.Context, branch, dest string) error {
 		return fmt.Errorf("git pull --rebase: %w: %s", err, out)
 	}
 	return nil
+}
+
+// Head returns the commit a checkout currently points at.
+func Head(ctx context.Context, dest string) (string, error) {
+	return head(ctx, dest)
 }
 
 func head(ctx context.Context, dest string) (string, error) {

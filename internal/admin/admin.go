@@ -9,6 +9,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,12 +73,43 @@ func ControllerAddRepo(ctx context.Context, home, name, url, branch string, log 
 		return err
 	}
 	dest := filepath.Join(config.ReposDir(home), name)
-	commit, err := gitsync.Sync(ctx, url, branch, dest)
+	commit, err := gitsync.SyncInit(ctx, url, branch, dest)
 	if err != nil {
 		return fmt.Errorf("clone repo %q: %w", name, err)
 	}
+	// A brand-new deployment repo carries neither the branch nor an inventory.
+	// Both are published here, because a node clones the branch during 'node add'
+	// before the controller writes the node into the inventory.
+	created, err := ensureInventory(ctx, dest, branch)
+	if err != nil {
+		return fmt.Errorf("repo %q: %w", name, err)
+	}
+	if created {
+		if commit, err = gitsync.Head(ctx, dest); err != nil {
+			return fmt.Errorf("repo %q: %w", name, err)
+		}
+		log.Info("inventory initialised", "repo", name, "file", "inventory/nodes.yml")
+	}
 	log.Info("repo added", "repo", name, "url", url, "branch", branch, "commit", commit)
 	return nil
+}
+
+// ensureInventory creates and pushes an empty inventory/nodes.yml when the repo
+// has none, so the branch exists on the remote and 'node add' has a file to
+// extend. It reports whether it wrote one.
+func ensureInventory(ctx context.Context, dest, branch string) (bool, error) {
+	if _, err := os.Stat(repo.InventoryPath(dest)); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if err := repo.SaveInventory(dest, repo.Inventory{}); err != nil {
+		return false, err
+	}
+	if err := gitsync.CommitPush(ctx, dest, branch, "inventory: initialise nodes.yml", "inventory/nodes.yml"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ProvisionOptions configures provisioning a new node from the controller.
