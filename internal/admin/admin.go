@@ -104,10 +104,10 @@ type ProvisionOptions struct {
 func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 	log := logger(opts.Logger)
 	if opts.Name == "" {
-		return fmt.Errorf("bootstrap requires --name")
+		return fmt.Errorf("node add requires a node name")
 	}
 	if opts.Location == "" {
-		return fmt.Errorf("bootstrap requires --location")
+		return fmt.Errorf("node add requires a location")
 	}
 
 	ctrlCfg, err := config.Load(opts.ControllerHome)
@@ -115,7 +115,7 @@ func ProvisionNode(ctx context.Context, opts ProvisionOptions) error {
 		return fmt.Errorf("load controller config: %w", err)
 	}
 	if !ctrlCfg.IsController() {
-		return fmt.Errorf("bootstrap must run from a controller home (%s)", config.ControllerFile)
+		return fmt.Errorf("node add must run from a controller home (%s)", config.ControllerFile)
 	}
 	r, err := pickRepo(ctrlCfg.Repos, opts.RepoName)
 	if err != nil {
@@ -354,7 +354,7 @@ func registerNode(ctx context.Context, log *slog.Logger, home, repoName, name, l
 func NodeRemove(ctx context.Context, home, repoName, name string, keepContainers, keepHome bool, log *slog.Logger) error {
 	log = logger(log)
 	if name == "" {
-		return fmt.Errorf("node rm requires a node name")
+		return fmt.Errorf("node remove requires a node name")
 	}
 	cfg, err := config.Load(home)
 	if err != nil {

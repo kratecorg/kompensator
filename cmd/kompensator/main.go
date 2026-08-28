@@ -65,10 +65,11 @@ func main() {
 		os.Exit(cmdCheck(g, rest))
 	case "controller":
 		os.Exit(cmdController(g, rest))
-	case "bootstrap":
-		os.Exit(cmdBootstrap(g, rest))
 	case "node":
 		os.Exit(cmdNode(g, rest))
+	case "bootstrap":
+		fmt.Fprintln(os.Stderr, "error: 'bootstrap' is now 'kompensator node add <name> <location>'")
+		os.Exit(2)
 	case "secrets":
 		os.Exit(cmdSecrets(g, rest))
 	case "version":
@@ -408,7 +409,7 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// cmdCheck audits a bootstrap. On a node home it runs the node-local checks
+// cmdCheck audits a node's setup. On a node home it runs the node-local checks
 // (config, binary, age key, repo checkout, reconcile cron). On a controller
 // home it audits every inventory node, re-executing the agent over ssh.
 func cmdCheck(g globals, args []string) int {
@@ -419,7 +420,7 @@ func cmdCheck(g globals, args []string) int {
 	fs.StringVar(&controllerVersion, "controller-version", "", "internal: controller version token for node-side comparison")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] check [--update]")
-		fmt.Fprintln(os.Stderr, "  On a node: checks the local bootstrap. On a controller: checks every node.")
+		fmt.Fprintln(os.Stderr, "  On a node: checks the local setup. On a controller: checks every node.")
 		fs.PrintDefaults()
 	}
 	if _, err := parseFlagsAndArgs(fs, args); err != nil {
@@ -546,28 +547,29 @@ func cmdControllerRepo(g globals, args []string) int {
 	return 0
 }
 
-// cmdBootstrap provisions a new node from the controller: it copies the
+// cmdNodeAdd provisions a new node from the controller: it copies the
 // kompensator binary, writes the node's node.yml (following one repo), clones
 // that repo on the node and registers it in the repo's inventory.
-func cmdBootstrap(g globals, args []string) int {
-	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
-	name := fs.String("name", "", "node name in the inventory")
-	location := fs.String("location", "", "ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator) or an absolute local path")
+func cmdNodeAdd(g globals, args []string) int {
+	fs := flag.NewFlagSet("node add", flag.ContinueOnError)
 	repoName := fs.String("repo", "", "which repo the node follows (default: the sole repo)")
 	statusWriteback := fs.Bool("status-writeback", false, "publish reconcile status to the node's git status branch")
 	statusWritebackAlways := fs.Bool("status-writeback-always", false, "publish on every reconcile instead of only when the status changed")
 	schedule := fs.String("schedule", config.DefaultSchedule, "cron schedule for the node's self-reconcile")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] bootstrap --name <node> --location <loc> [--repo <name>] [--status-writeback] [--status-writeback-always] [--schedule <cron>]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node add <name> <location> [--repo <name>] [--status-writeback] [--status-writeback-always] [--schedule <cron>]")
+		fmt.Fprintln(os.Stderr, "  <location> is ssh://[user@]host[:port][/path] (path defaults to ~/.config/kompensator)")
+		fmt.Fprintln(os.Stderr, "  or an absolute local path.")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
 	if err != nil {
 		return 2
 	}
-	// Allow the name to be given positionally too: bootstrap <name> --location ...
-	if *name == "" {
-		*name = arg(pos, 0)
+	name, location := arg(pos, 0), arg(pos, 1)
+	if name == "" || location == "" {
+		fs.Usage()
+		return 2
 	}
 
 	h, err := resolveHome(g.home)
@@ -582,42 +584,47 @@ func cmdBootstrap(g globals, args []string) int {
 	log := newLogger(g.jsonLog)
 	if err := admin.ProvisionNode(ctx, admin.ProvisionOptions{
 		ControllerHome:        h,
-		Name:                  *name,
-		Location:              *location,
+		Name:                  name,
+		Location:              location,
 		RepoName:              *repoName,
 		StatusWriteback:       *statusWriteback,
 		StatusWritebackAlways: *statusWritebackAlways,
 		Schedule:              *schedule,
 		Logger:                log,
 	}); err != nil {
-		log.Error("bootstrap failed", "error", err)
+		log.Error("node add failed", "error", err)
 		return 1
 	}
 	return 0
 }
 
+// cmdNode handles node administration from a controller home: adding a node to
+// the inventory and provisioning it, and removing it again.
 func cmdNode(g globals, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <rm> ...")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <add|remove> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
-	case "rm", "remove":
+	case "add":
+		return cmdNodeAdd(g, rest)
+	case "remove":
 		return cmdNodeRemove(g, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown node subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node <add|remove> ...")
 		return 2
 	}
 }
 
 func cmdNodeRemove(g globals, args []string) int {
-	fs := flag.NewFlagSet("node rm", flag.ContinueOnError)
+	fs := flag.NewFlagSet("node remove", flag.ContinueOnError)
 	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
 	keepContainers := fs.Bool("keep-containers", false, "do not tear down the node's containers")
 	keepHome := fs.Bool("keep-home", false, "do not delete the node's home directory")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node rm <name> [--repo <name>] [--keep-containers] [--keep-home]")
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] node remove <name> [--repo <name>] [--keep-containers] [--keep-home]")
 		fs.PrintDefaults()
 	}
 	pos, err := parseFlagsAndArgs(fs, args)
@@ -640,7 +647,7 @@ func cmdNodeRemove(g globals, args []string) int {
 
 	log := newLogger(g.jsonLog)
 	if err := admin.NodeRemove(ctx, h, *repoName, name, *keepContainers, *keepHome, log); err != nil {
-		log.Error("node rm failed", "error", err)
+		log.Error("node remove failed", "error", err)
 		return 1
 	}
 	return 0
@@ -976,18 +983,21 @@ Commands:
                     --commit <sha>  desired commit (default: deploy branch tip)
                     --wait          poll until healthy or --timeout
                     --repo-path <d> verify a bare checkout (CI, no home)
-  check             Audit a bootstrap: on a node checks its config, binary,
+  check             Audit a node's setup: on a node checks its config, binary,
                     age key, repo checkout and reconcile cron; on a controller
                     audits every node over ssh
   controller init   Initialise a controller home (writes controller.yml)
   controller repo add <name> <url> [--branch <b>]
                     Add a deployment repo to the controller and clone it
-  bootstrap         Provision a new node from the controller: copy the binary,
+  node add <name> <location>
+                    Provision a new node from the controller: copy the binary,
                     write its node.yml (following one repo), clone that repo on
-                    it and register it in the repo's inventory
-                    --name <node> --location <loc> [--repo <name>]
-                    [--status-writeback] [--schedule <cron>]
-  node rm <name>    Deregister a node and tear down its containers and home
+                    it and register it in the repo's inventory. <location> is
+                    ssh://[user@]host[:port][/path] or an absolute local path
+                    --repo <name>     which repo the node follows
+                    --status-writeback / --schedule <cron>
+  node remove <name>
+                    Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
                     --repo <name>   which repo's inventory (default: the sole one)
   secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
@@ -1014,8 +1024,8 @@ Examples:
   kompensator resume
   kompensator -home /opt/controller controller init
   kompensator -home /opt/controller controller repo add prod ssh://git@example.org/org/deploy.git
-  kompensator -home /opt/controller bootstrap --name node7 --location ssh://peter@host.example.org
-  kompensator -home /opt/controller node rm node7
+  kompensator -home /opt/controller node add node7 ssh://peter@host.example.org
+  kompensator -home /opt/controller node remove node7
   echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
   kompensator -home /opt/controller secrets rekey prod
 `)

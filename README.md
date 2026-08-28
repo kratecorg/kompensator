@@ -73,8 +73,9 @@ Common commands:
 | `status [env]` | Show desired vs. running images |
 | `pause` / `resume` | Suspend/resume reconciling during a delicate operation |
 | `verify <env>` | Check from Git that every node reached the desired commit and is healthy |
-| `check` | Audit a node/controller bootstrap |
-| `bootstrap` | Provision a new node from the controller |
+| `check` | Audit a node/controller setup |
+| `controller init` / `controller repo add` | Set up a controller home and its deployment repos |
+| `node add` / `node remove` | Provision or deregister a node from the controller |
 | `secrets …` | Manage age-encrypted environment and file secrets |
 | `version` | Print the version |
 

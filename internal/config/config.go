@@ -18,7 +18,7 @@ const (
 )
 
 const controllerHeader = "# kompensator controller config (managed by 'kompensator controller ...').\n"
-const nodeHeader = "# kompensator node-local config (managed by 'kompensator bootstrap').\n"
+const nodeHeader = "# kompensator node-local config (managed by 'kompensator node add').\n"
 
 // DefaultSchedule is the cron expression a node reconciles on when its config
 // leaves the schedule unset: once a minute.
@@ -176,7 +176,7 @@ func Load(home string) (*Config, error) {
 	case nodeOK:
 		return loadNode(nodePath)
 	default:
-		return nil, fmt.Errorf("no %s or %s in %s: run 'kompensator controller init' or 'kompensator bootstrap'", ControllerFile, NodeFile, home)
+		return nil, fmt.Errorf("no %s or %s in %s: run 'kompensator controller init' or 'kompensator node add'", ControllerFile, NodeFile, home)
 	}
 }
 

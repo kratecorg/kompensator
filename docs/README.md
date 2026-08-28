@@ -59,5 +59,5 @@ kompensator is built incrementally — see [roadmap.md](roadmap.md) for details.
    created manually/locally.
 2. **Phase 2 — Load balancer plugin.** Pluggable proxy interface with the
    `haproxy-local` plugin: a local HAProxy is notified of a Blue/Green switch.
-3. **Phase 2–3 — Bootstrapping.** `kompensator bootstrap` creates the config folder,
+3. **Phase 2–3 — Bootstrapping.** `kompensator node add` creates the config folder,
    checks out the deployment repo(s) and installs the cron job — locally or remotely.

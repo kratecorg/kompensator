@@ -10,7 +10,7 @@ kompensator uses two kinds of configuration:
 
 ## Node-local config
 
-Created manually in Phase 1 (by `kompensator bootstrap` later). Holds no secrets.
+Created manually in Phase 1 (by `kompensator node add` later). Holds no secrets.
 
 ```
 ~/.config/kompensator/

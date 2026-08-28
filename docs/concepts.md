@@ -94,6 +94,6 @@ in the initial implementation.
 | `kompensator apply <env> [--select <labels>]` | Controller | Trigger reconcile on all (or selected) nodes in parallel. |
 | `kompensator status <env>` | Controller | Query nodes live over SSH and show an aggregated state table. |
 | `kompensator diff <env>` | Controller | Show desired vs. actual per node without changing anything. |
-| `kompensator bootstrap [node]` | Controller/Agent | Create config, clone deployment repo(s), install cron — locally or remotely. |
+| `kompensator node add <node>` | Controller | Create config, clone deployment repo(s), install cron on the node. |
 | `kompensator rollback <env>` | Controller | Switch nodes back to the previously active color. |
 | `kompensator proxy get-config <env>` | Agent | Print an HAProxy backend definition to copy into HAProxy config. |
