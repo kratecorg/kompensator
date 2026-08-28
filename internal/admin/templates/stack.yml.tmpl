@@ -1,0 +1,35 @@
+# {{.Name}} stack: the environment-independent definition of a set of compose
+# projects that are deployed together.
+#
+# Add a project with:
+#   kompensator project add {{.Name}} <project>
+#
+# Nothing here is environment-specific. An environment picks the stack up in
+# environments/<env>/env.yml, pins it to nodes and overrides the variables below.
+name: {{.Name}}
+
+# Docker networks kompensator creates (idempotently) before any project of this
+# stack deploys, so no project has to own a shared network through compose —
+# every compose file joins them as external. ${STACK_PREFIX} scopes a name to
+# this node, environment and stack, so the environments never collide.
+networks:
+  - ${STACK_PREFIX}-internal
+{{if .Proxy}}
+# A stack-internal reverse proxy kompensator synthesizes and runs for this stack;
+# there is no compose file for it. It is the default target of the projects'
+# proxy bindings and is repointed atomically on every Blue/Green switch. It
+# publishes no host port: put a user-managed edge proxy in front of it if the
+# stack has to be reachable from outside.
+proxy:
+  kind: {{.Proxy}}
+  networks:
+    - ${STACK_PREFIX}-internal
+{{end}}
+# Default values for the ${VAR} placeholders the compose files below reference.
+# An environment overrides any of them in environments/<env>/env.yml; secrets do
+# NOT belong here (use 'kompensator secrets set <env> {{.Name}}').
+variables: {}
+
+# Compose projects, appended by 'kompensator project add'. Each is deployed as a
+# compose project of its own and switches color as a whole.
+projects:

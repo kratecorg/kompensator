@@ -1,0 +1,47 @@
+# {{.Stack}} / {{.Project}} — one Docker Compose project.
+#
+# kompensator deploys this file as a compose project of its own{{if .BlueGreen}} and switches it
+# Blue/Green as a whole: the new color is started alongside the old one, and the
+# proxy is only repointed once the healthcheck below passes{{else}} and recreates it in
+# place (strategy: recreate), so it is never running twice{{end}}.
+#
+# Two things kompensator relies on:
+#   * the image comes from ${{"{"}}{{.Var}}_IMAGE{{"}"}}:${{"{"}}{{.Var}}_TAG{{"}"}}, which it injects from
+#     environments/<env>/state/{{.Stack}}.yml — never hardcode a tag here;
+#   * the service declares a healthcheck — an unhealthy container is a failed
+#     deploy{{if .BlueGreen}}, and without one the color switch has nothing to wait for{{end}}.
+#
+# Every other ${VAR} is resolved from the stack's variables, overridden per
+# environment and per node. NODE_NAME, ENV_NAME{{if .BlueGreen}} and COLOR{{end}} are always available.
+services:
+  {{.Service}}:
+    image: ${{"{"}}{{.Var}}_IMAGE{{"}"}}:${{"{"}}{{.Var}}_TAG{{"}"}}
+    restart: always
+    environment:
+      APP_ENV: ${ENV_NAME}
+{{- if .BlueGreen}}
+      APP_COLOR: ${COLOR}
+{{- end}}
+    networks:
+{{- if .BlueGreen}}
+      internal:
+        # The proxy reaches the serving color under this alias, so both colors
+        # can run side by side during a switch.
+        aliases:
+          - {{.Service}}-${COLOR}
+{{- else}}
+      - internal
+{{- end}}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:{{.Port}}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+# Created by kompensator's stack network phase (see stacks/{{.Stack}}/stack.yml)
+# before any project deploys, so this project only joins it.
+networks:
+  internal:
+    external: true
+    name: ${STACK_PREFIX}-internal

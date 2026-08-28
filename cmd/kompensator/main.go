@@ -67,6 +67,12 @@ func main() {
 		os.Exit(cmdController(g, rest))
 	case "node":
 		os.Exit(cmdNode(g, rest))
+	case "env":
+		os.Exit(cmdEnv(g, rest))
+	case "stack":
+		os.Exit(cmdStack(g, rest))
+	case "project":
+		os.Exit(cmdProject(g, rest))
 	case "bootstrap":
 		fmt.Fprintln(os.Stderr, "error: 'bootstrap' is now 'kompensator node add <name> <location>'")
 		os.Exit(2)
@@ -664,6 +670,223 @@ func dash(s string) string {
 	return s
 }
 
+// cmdEnv handles environment administration in the deployment repo.
+func cmdEnv(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list> ...")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list":
+		return cmdEnvList(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown env subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env <list> ...")
+		return 2
+	}
+}
+
+func cmdEnvList(g globals, args []string) int {
+	fs := flag.NewFlagSet("env list", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] env list [--repo <name>]")
+		fs.PrintDefaults()
+	}
+	if _, err := parseFlagsAndArgs(fs, args); err != nil {
+		return 2
+	}
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	envs, err := admin.EnvList(ctx, h, *repoName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if len(envs) == 0 {
+		fmt.Println("No environments defined in the repo.")
+		return 0
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "ENV\tSTACKS")
+	for _, e := range envs {
+		fmt.Fprintf(tw, "%s\t%s\n", e.Name, dash(strings.Join(e.Stacks, ", ")))
+	}
+	tw.Flush()
+	return 0
+}
+
+// cmdStack handles stack administration in the deployment repo.
+func cmdStack(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add> ...")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list":
+		return cmdStackList(g, rest)
+	case "add":
+		return cmdStackAdd(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown stack subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack <list|add> ...")
+		return 2
+	}
+}
+
+func cmdStackList(g globals, args []string) int {
+	fs := flag.NewFlagSet("stack list", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack list [--repo <name>]")
+		fs.PrintDefaults()
+	}
+	if _, err := parseFlagsAndArgs(fs, args); err != nil {
+		return 2
+	}
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	stacks, err := admin.StackList(ctx, h, *repoName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if len(stacks) == 0 {
+		fmt.Println("No stacks defined in the repo.")
+		return 0
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "STACK\tPROXY\tPROJECTS\tPLACED IN")
+	for _, s := range stacks {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, dash(s.Proxy),
+			dash(strings.Join(s.Projects, ", ")), dash(strings.Join(s.Envs, ", ")))
+	}
+	tw.Flush()
+	return 0
+}
+
+func cmdStackAdd(g globals, args []string) int {
+	fs := flag.NewFlagSet("stack add", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	proxy := fs.String("proxy", "", "give the stack a managed reverse proxy of this kind (traefik)")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] stack add <name> [--proxy traefik] [--repo <name>] [--dry-run]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	name := arg(pos, 0)
+	if name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.StackAdd(ctx, admin.StackAddOptions{
+		Home:     h,
+		RepoName: *repoName,
+		Name:     name,
+		Proxy:    *proxy,
+		DryRun:   *dryRun,
+		Logger:   log,
+	}); err != nil {
+		log.Error("stack add failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdProject handles project administration inside a stack.
+func cmdProject(g globals, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add> ...")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "add":
+		return cmdProjectAdd(g, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown project subcommand: %s\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project <add> ...")
+		return 2
+	}
+}
+
+func cmdProjectAdd(g globals, args []string) int {
+	fs := flag.NewFlagSet("project add", flag.ContinueOnError)
+	repoName := fs.String("repo", "", "deployment repo name (default: the sole repo)")
+	service := fs.String("service", "", "compose service name (default: the project name)")
+	strategy := fs.String("strategy", "blue-green", "deploy strategy: blue-green or recreate")
+	port := fs.Int("port", 8080, "the service's container port")
+	route := fs.Bool("route", false, "route the service through the stack's managed proxy")
+	dryRun := fs.Bool("dry-run", false, "print the diff instead of committing and pushing it")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] project add <stack> <project> [--service <name>] [--strategy <s>] [--port <n>] [--route] [--repo <name>] [--dry-run]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseFlagsAndArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	stack, name := arg(pos, 0), arg(pos, 1)
+	if stack == "" || name == "" {
+		fs.Usage()
+		return 2
+	}
+
+	h, err := resolveHome(g.home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := newLogger(g.jsonLog)
+	if err := admin.ProjectAdd(ctx, admin.ProjectAddOptions{
+		Home:     h,
+		RepoName: *repoName,
+		Stack:    stack,
+		Name:     name,
+		Service:  *service,
+		Strategy: *strategy,
+		Port:     *port,
+		Route:    *route,
+		DryRun:   *dryRun,
+		Logger:   log,
+	}); err != nil {
+		log.Error("project add failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
 func cmdSecrets(g globals, args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Usage: kompensator [global flags] secrets <set|set-key|set-file|show|edit|rekey> ...")
@@ -1004,6 +1227,20 @@ Commands:
                     Deregister a node and tear down its containers and home
                     --keep-containers / --keep-home to skip teardown
                     --repo <name>   which repo's inventory (default: the sole one)
+  env list          List the environments the deployment repo defines and the
+                    stacks each one places
+  stack list        List the stacks, their projects and where they are placed
+  stack add <name>  Scaffold stacks/<name>/stack.yml in the deployment repo
+                    --proxy traefik give the stack a managed reverse proxy
+                    --dry-run       show the diff instead of pushing it
+  project add <stack> <project>
+                    Scaffold a compose file for the project and register it in
+                    the stack, keeping stack.yml's comments intact
+                    --service <name>  compose service (default: the project)
+                    --strategy <s>    blue-green (default) or recreate
+                    --port <n>        the service's container port
+                    --route           route it through the stack's proxy
+                    --dry-run         show the diff instead of pushing it
   secrets set <env> <stack>    Encrypt a flat YAML map (read from stdin) of
                                secrets for an environment's stack
   secrets set-key <env> <stack> <KEY> [value]
@@ -1033,6 +1270,8 @@ Examples:
   kompensator -home /opt/controller controller repo add prod ssh://git@example.org/org/deploy.git
   kompensator -home /opt/controller node add node7 ssh://peter@host.example.org
   kompensator -home /opt/controller node remove node7
+  kompensator -home /opt/controller stack add shop --proxy traefik
+  kompensator -home /opt/controller project add shop api --port 8080 --route
   echo 'DB_PASSWORD: s3cr3t' | kompensator -home /opt/controller secrets set prod carimco
   kompensator -home /opt/controller secrets rekey prod
   source <(kompensator completion bash)

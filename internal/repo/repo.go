@@ -738,13 +738,23 @@ func SaveInventory(repoRoot string, inv Inventory) error {
 // LoadEnvironment reads environments/<env>/env.yml.
 func LoadEnvironment(repoRoot, env string) (Environment, error) {
 	var e Environment
-	if err := loadYAML(filepath.Join(repoRoot, "environments", env, "env.yml"), &e); err != nil {
+	if err := loadYAML(EnvironmentFile(repoRoot, env), &e); err != nil {
 		return Environment{}, err
 	}
 	if e.Name == "" {
 		e.Name = env
 	}
 	return e, nil
+}
+
+// EnvironmentDir returns the absolute path to an environment's directory.
+func EnvironmentDir(repoRoot, env string) string {
+	return filepath.Join(repoRoot, "environments", env)
+}
+
+// EnvironmentFile returns the absolute path to an environment's definition.
+func EnvironmentFile(repoRoot, env string) string {
+	return filepath.Join(EnvironmentDir(repoRoot, env), "env.yml")
 }
 
 // ListEnvironments returns the names of every environment defined in the repo
@@ -779,6 +789,11 @@ func StackDir(repoRoot, stack string) string {
 	return filepath.Join(repoRoot, "stacks", stack)
 }
 
+// StackFile returns the absolute path to a stack's definition.
+func StackFile(repoRoot, stack string) string {
+	return filepath.Join(StackDir(repoRoot, stack), "stack.yml")
+}
+
 // ListStacks returns the names of every stack defined in the repo (every
 // stacks/<name>/ directory that holds a stack.yml), sorted.
 func ListStacks(repoRoot string) ([]string, error) {
@@ -804,10 +819,26 @@ func ListStacks(repoRoot string) ([]string, error) {
 	return stacks, nil
 }
 
+// EnvVarName converts a service name to the uppercase env-var prefix under
+// which kompensator injects its image and tag, e.g. "frontend" -> "FRONTEND",
+// "apk-distribution" -> "APK_DISTRIBUTION".
+func EnvVarName(service string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - ('a' - 'A')
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return '_'
+		}
+	}, service)
+}
+
 // LoadStack reads stacks/<stack>/stack.yml.
 func LoadStack(repoRoot, stack string) (Stack, error) {
 	var s Stack
-	if err := loadYAML(filepath.Join(StackDir(repoRoot, stack), "stack.yml"), &s); err != nil {
+	if err := loadYAML(StackFile(repoRoot, stack), &s); err != nil {
 		return Stack{}, err
 	}
 	if s.Name == "" {

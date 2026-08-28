@@ -1380,7 +1380,7 @@ func buildEnv(names runtime.Names, envName, stack, project, proxyDir string, var
 
 	refs = make(map[string]string, len(desired))
 	for svc, si := range desired {
-		v := envVarName(svc)
+		v := repo.EnvVarName(svc)
 		merged[v+"_IMAGE"] = si.Image
 		merged[v+"_TAG"] = si.Tag
 		// A one-shot job exits after running, so it never appears in the
@@ -1399,21 +1399,6 @@ func buildEnv(names runtime.Names, envName, stack, project, proxyDir string, var
 	}
 	sort.Strings(extraEnv)
 	return extraEnv, refs
-}
-
-// envVarName converts a service name to an uppercase env-var-safe prefix, e.g.
-// "frontend" -> "FRONTEND", "next-cloud" -> "NEXT_CLOUD".
-func envVarName(service string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r - ('a' - 'A')
-		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-			return r
-		default:
-			return '_'
-		}
-	}, service)
 }
 
 // runningByColor returns, for each Blue/Green color that has running
