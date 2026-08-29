@@ -106,6 +106,7 @@ kompensator completion fish > ~/.config/fish/completions/kompensator.fish
 | Document | Description |
 | --- | --- |
 | [docs/README.md](docs/README.md) | Documentation index |
+| [docs/getting-started.md](docs/getting-started.md) | Prerequisites and first setup (controller + remote nodes) |
 | [docs/architecture.md](docs/architecture.md) | System architecture, components, and diagrams |
 | [docs/concepts.md](docs/concepts.md) | Glossary and core concepts |
 | [docs/repository-layout.md](docs/repository-layout.md) | Layout of a GitOps deployment repo |

@@ -20,6 +20,7 @@ Compose. Traffic switching during a deployment is handled by a pluggable
 
 | Document | Description |
 | --- | --- |
+| [getting-started.md](getting-started.md) | Prerequisites and first setup (controller + remote nodes) |
 | [roadmap.md](roadmap.md) | Phased implementation plan (what to build first) |
 | [architecture.md](architecture.md) | System architecture, components, and diagrams |
 | [concepts.md](concepts.md) | Glossary and core concepts |
