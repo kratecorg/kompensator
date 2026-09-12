@@ -27,13 +27,21 @@ type Info struct {
 }
 
 // Current resolves the running binary's version. tag is the release version
-// injected with -ldflags "-X main.buildVersion=<tag>"; when empty (a plain dev
-// build) the version is derived from the embedded VCS build info.
+// injected with -ldflags "-X main.buildVersion=<tag>"; when empty the module
+// version stamped by `go install <module>@<tag>` is used, and only a build
+// without either (a plain local build) falls back to the embedded VCS info.
 func Current(tag string) Info {
 	if v, ok := parseRelease(strings.TrimSpace(tag)); ok {
 		return v
 	}
-	return buildInfoDev()
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return Info{raw: "dev"}
+	}
+	if v, ok := parseRelease(bi.Main.Version); ok {
+		return v
+	}
+	return buildInfoDev(bi)
 }
 
 // Parse reconstructs an Info from the token another binary printed with
@@ -149,13 +157,8 @@ func parseDev(s string) (Info, bool) {
 
 // buildInfoDev derives a dev version from the binary's embedded VCS info, so a
 // plain `go build` yields a comparable, timestamped version without ldflags.
-func buildInfoDev() Info {
+func buildInfoDev(bi *debug.BuildInfo) Info {
 	var v Info
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
-		v.raw = "dev"
-		return v
-	}
 	var modified bool
 	for _, s := range bi.Settings {
 		switch s.Key {

@@ -22,8 +22,9 @@ import (
 )
 
 // buildVersion is the release tag, injected at build time with
-// -ldflags "-X main.buildVersion=<tag>". Empty in plain dev builds, where the
-// version is instead derived from the embedded VCS build info.
+// -ldflags "-X main.buildVersion=<tag>". Empty for `go install <module>@<tag>`
+// and plain dev builds, where version.Current falls back to the embedded build
+// info.
 var buildVersion = ""
 
 // globals holds flags shared by all subcommands. They must be given before the
