@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="kompensator logo" width="160">
+</p>
+
 # kompensator
 
 [![CI](https://github.com/kratecorg/kompensator/actions/workflows/ci.yml/badge.svg)](https://github.com/kratecorg/kompensator/actions/workflows/ci.yml)
