@@ -395,6 +395,28 @@ func Deploy(ctx context.Context, composeFile, project string, labels Labels, ext
 // container(s) a command must act on. host is the docker "-H" endpoint ("" =
 // local daemon).
 func ManagedContainerNames(ctx context.Context, host, env, stack, project string) ([]string, error) {
+	return managedContainerNames(ctx, host, env, stack, project, "")
+}
+
+// SignalManagedContainers sends signal to every running container of a
+// kompensator-managed project, narrowed to one compose service when service is
+// set. It returns the signalled container names; none running is not an error.
+func SignalManagedContainers(ctx context.Context, host, env, stack, project, service, signal string) ([]string, error) {
+	containers, err := managedContainerNames(ctx, host, env, stack, project, service)
+	if err != nil {
+		return nil, err
+	}
+	if len(containers) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"kill", "--signal", signal}, containers...)
+	if out, err := output(ctx, "docker", dockerArgs(host, args...)...); err != nil {
+		return nil, fmt.Errorf("docker kill --signal %s: %w: %s", signal, err, out)
+	}
+	return containers, nil
+}
+
+func managedContainerNames(ctx context.Context, host, env, stack, project, service string) ([]string, error) {
 	args := []string{"ps", "--filter", "label=" + LabelManaged + "=true"}
 	if env != "" {
 		args = append(args, "--filter", "label="+LabelEnv+"="+env)
@@ -404,6 +426,9 @@ func ManagedContainerNames(ctx context.Context, host, env, stack, project string
 	}
 	if project != "" {
 		args = append(args, "--filter", "label="+LabelProject+"="+project)
+	}
+	if service != "" {
+		args = append(args, "--filter", "label=com.docker.compose.service="+service)
 	}
 	args = append(args, "--format", "{{.Names}}")
 	out, err := output(ctx, "docker", dockerArgs(host, args...)...)
@@ -492,6 +517,43 @@ func ComposeVariables(ctx context.Context, composeFile string, env []string) (ma
 		used[name] = true
 	}
 	return used, nil
+}
+
+// ComposeBindSources returns the host paths the compose file bind-mounts, as
+// resolved by compose (absolute, variables interpolated, active profiles only).
+func ComposeBindSources(ctx context.Context, composeFile string, env []string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "config", "--format", "json")
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("docker compose config (%s): %w: %s", composeFile, err, strings.TrimSpace(stderr.String()))
+	}
+	var model struct {
+		Services map[string]struct {
+			Volumes []struct {
+				Type   string `json:"type"`
+				Source string `json:"source"`
+			} `json:"volumes"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &model); err != nil {
+		return nil, fmt.Errorf("parse compose config (%s): %w", composeFile, err)
+	}
+	seen := map[string]bool{}
+	var sources []string
+	for _, service := range model.Services {
+		for _, volume := range service.Volumes {
+			if volume.Type != "bind" || volume.Source == "" || seen[volume.Source] {
+				continue
+			}
+			seen[volume.Source] = true
+			sources = append(sources, volume.Source)
+		}
+	}
+	sort.Strings(sources)
+	return sources, nil
 }
 
 // writeLabelOverride writes a compose override file that stamps the kompensator

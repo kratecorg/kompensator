@@ -43,8 +43,11 @@ type statusDoc struct {
 // projectStatus is the recorded state of one project, keyed in the document by
 // "<stack>/<project>".
 type projectStatus struct {
-	ConfigHash string                  `yaml:"configHash,omitempty"`
-	Services   map[string]serviceState `yaml:"services,omitempty"`
+	ConfigHash string `yaml:"configHash,omitempty"`
+	// MountHash fingerprints the bind-mounted repo files last applied by a
+	// reload; only tracked for projects that declare one.
+	MountHash string                  `yaml:"mountHash,omitempty"`
+	Services  map[string]serviceState `yaml:"services,omitempty"`
 }
 
 // serviceState is the observed running state of one service within a project.

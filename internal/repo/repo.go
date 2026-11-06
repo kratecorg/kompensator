@@ -579,6 +579,19 @@ type Project struct {
 	// frontend and a backend), so it can declare one binding per routed service.
 	// Only meaningful for Blue/Green projects.
 	Proxy []ProxyBinding `yaml:"proxy,omitempty"`
+	// Reload, when set, applies a change to the project's bind-mounted repo
+	// files by signalling the running containers instead of recreating them.
+	Reload *ProjectReload `yaml:"reload,omitempty"`
+}
+
+// ProjectReload is the live reload of a project whose bind-mounted config
+// changed, e.g. SIGUSR2 for haproxy. Only file content changes are reloaded;
+// image, compose or variable changes still redeploy the project.
+type ProjectReload struct {
+	// Signal is passed to `docker kill --signal`, e.g. "USR2" or "SIGHUP".
+	Signal string `yaml:"signal"`
+	// Service narrows the signal to one compose service; empty signals all.
+	Service string `yaml:"service,omitempty"`
 }
 
 // ProxyBinding declares which reverse proxy fronts a Blue/Green project and how
@@ -855,6 +868,9 @@ func LoadStack(repoRoot, stack string) (Stack, error) {
 	for i := range s.Projects {
 		if s.Projects[i].Strategy == "" {
 			s.Projects[i].Strategy = StrategyBlueGreen
+		}
+		if r := s.Projects[i].Reload; r != nil && strings.TrimSpace(r.Signal) == "" {
+			return Stack{}, fmt.Errorf("stack %q project %q: reload needs a signal", s.Name, s.Projects[i].Name)
 		}
 		// A binding inherits the stack's managed proxy kind when it does not name
 		// one, so the common case needs no per-binding "kind".
